@@ -60,6 +60,19 @@
       <button type="button" id="generate-btn" class="primary-btn">
         Generate route
       </button>
+
+      <!-- Filled by app.js after each successful route (aria-live helps screen readers) -->
+      <div id="route-stats" class="route-stats" hidden aria-live="polite">
+        <h2 class="stats-heading">Route summary</h2>
+        <ul class="stats-list">
+          <li>Total distance: <strong id="stat-distance">—</strong></li>
+          <li>Elevation gain: <strong id="stat-elevation-gain">—</strong></li>
+          <li>Elevation loss: <strong id="stat-elevation-loss">—</strong></li>
+          <li>Traffic signals (approx.): <strong id="stat-signals">—</strong></li>
+        </ul>
+      </div>
+
+      <p id="status-msg" class="status-msg" role="status"></p>
     </aside>
 
     <!--

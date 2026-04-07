@@ -82,3 +82,42 @@ body {
   outline: 2px solid #0d47a1;
   outline-offset: 2px;
 }
+
+.primary-btn:disabled {
+  cursor: wait;
+  opacity: 0.75;
+}
+
+.route-stats {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid #e0e0e0;
+}
+
+.stats-heading {
+  margin: 0 0 8px;
+  font-size: 0.95rem;
+}
+
+.stats-list {
+  margin: 0;
+  padding-left: 1.1rem;
+  font-size: 0.88rem;
+  line-height: 1.5;
+  color: #333;
+}
+
+.stats-list strong {
+  color: #0d47a1;
+}
+
+.status-msg {
+  margin: 10px 0 0;
+  min-height: 1.2em;
+  font-size: 0.82rem;
+  color: #555;
+}
+
+.status-msg.error {
+  color: #c62828;
+}
