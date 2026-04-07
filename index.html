@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <!-- Character encoding: tells the browser how to read text (accents, emoji, etc.) -->
+    <meta charset="UTF-8" />
+
+    <!-- Makes mobile browsers use a sensible width instead of shrinking the whole page -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+    <title>Route Runner</title>
+
+    <!--
+      Leaflet CSS (styles for map tiles, controls, popups).
+      Load this BEFORE your own style.css so you can override Leaflet if needed.
+    -->
+    <link
+      rel="stylesheet"
+      href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+      crossorigin=""
+    />
+
+    <!-- Your app’s layout and colors -->
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <!--
+      Map layer: Leaflet will “draw” inside #map.
+      The control panel sits on top (positioned in CSS) so it doesn’t replace the map.
+    -->
+    <div id="map" aria-label="Interactive map"></div>
+
+    <!--
+      Simple controls: a slider picks a distance; the button will later trigger route generation.
+      The <label> ties the text to the slider for accessibility (clicking the label focuses the slider).
+    -->
+    <aside class="control-panel" role="region" aria-label="Route options">
+      <h1 class="app-title">Route Runner</h1>
+      <p class="hint">Click the map to set your start point, then generate a loop.</p>
+
+      <div class="field">
+        <label for="distance-slider">
+          Target distance:
+          <span id="distance-value" class="distance-readout">5 km</span>
+        </label>
+        <!--
+          type="range" is a native slider. min/max/step are in kilometers for now (easy to change later).
+          value is the starting position when the page loads.
+        -->
+        <input
+          id="distance-slider"
+          type="range"
+          min="1"
+          max="42"
+          step="0.5"
+          value="5"
+        />
+      </div>
+
+      <button type="button" id="generate-btn" class="primary-btn">
+        Generate route
+      </button>
+    </aside>
+
+    <!--
+      Leaflet JavaScript: must load before app.js because app.js will use the global `L` object.
+      defer = run after HTML is parsed (good order: DOM exists, then scripts run).
+    -->
+    <script
+      src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+      integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+      crossorigin=""
+    ></script>
+    <script src="app.js" defer></script>
+  </body>
+</html>

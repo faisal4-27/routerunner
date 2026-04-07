@@ -1,0 +1,84 @@
+/* Full viewport: no stray margins so the map can truly fill the screen */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+}
+
+/* Leaflet needs an explicit height; 100% chains from html/body above */
+#map {
+  width: 100%;
+  height: 100%;
+  z-index: 0;
+}
+
+.control-panel {
+  position: absolute;
+  z-index: 1000; /* above map tiles */
+  top: 12px;
+  left: 12px;
+  max-width: min(320px, calc(100vw - 24px));
+  padding: 14px 16px;
+  background: rgba(255, 255, 255, 0.94);
+  border-radius: 10px;
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.12);
+}
+
+.app-title {
+  margin: 0 0 8px;
+  font-size: 1.15rem;
+}
+
+.hint {
+  margin: 0 0 14px;
+  font-size: 0.85rem;
+  color: #444;
+  line-height: 1.35;
+}
+
+.field {
+  margin-bottom: 12px;
+}
+
+.field label {
+  display: block;
+  font-size: 0.9rem;
+  margin-bottom: 6px;
+}
+
+.distance-readout {
+  font-weight: 600;
+  color: #0d47a1;
+}
+
+#distance-slider {
+  width: 100%;
+}
+
+.primary-btn {
+  width: 100%;
+  padding: 10px 14px;
+  font-size: 1rem;
+  font-weight: 600;
+  color: #fff;
+  background: #1565c0;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.primary-btn:hover {
+  background: #0d47a1;
+}
+
+.primary-btn:focus-visible {
+  outline: 2px solid #0d47a1;
+  outline-offset: 2px;
+}
