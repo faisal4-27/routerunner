@@ -44,10 +44,9 @@
   // --- Map setup (Leaflet creates a global `L`) ---
   var map = L.map("map").setView([48.137, 11.575], 12);
 
-  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-    maxZoom: 19,
-    attribution:
-      '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+  L.tileLayer("https://tiles.stadiamaps.com/tiles/outdoors/{z}/{x}/{y}{r}.png", {
+    maxZoom: 20,
+    attribution: '© Stadia Maps, © OpenStreetMap'
   }).addTo(map);
 
   // --- UI references ---
@@ -432,7 +431,7 @@
   slider.addEventListener("input", syncDistanceLabel);
   syncDistanceLabel();
 
-  generateBtn.addEventListener("click", function () {
+  function generateRoute() {
     if (!startPoint) {
       setStatus("Click the map first to choose your start point.", true);
       return;
@@ -506,5 +505,16 @@
       .finally(function () {
         generateBtn.disabled = false;
       });
+  }
+
+  generateBtn.addEventListener("click", generateRoute);
+
+  slider.addEventListener("keydown", function (ev) {
+    if (ev.key === "Enter") {
+      ev.preventDefault();
+      generateRoute();
+    }
   });
+
+  setStatus("Click the map to choose a starting point, then press Enter or generate.");
 })();

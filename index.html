@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+oc<!DOCTYPE html>
 <html lang="en">
   <head>
     <!-- Character encoding: tells the browser how to read text (accents, emoji, etc.) -->
@@ -20,60 +20,67 @@
       crossorigin=""
     />
 
+    <link
+      rel="stylesheet"
+      href="https://cdn.jsdelivr.net/npm/@fontsource/iosevka-charon@5.2.5/index.css"
+    />
+
     <!-- Your app’s layout and colors -->
     <link rel="stylesheet" href="style.css" />
   </head>
   <body>
-    <!--
-      Map layer: Leaflet will “draw” inside #map.
-      The control panel sits on top (positioned in CSS) so it doesn’t replace the map.
-    -->
-    <div id="map" aria-label="Interactive map"></div>
+    <main class="page-shell">
+      <header class="intro">
+        <h1 class="app-title">Route Runner</h1>
+        <p class="intro-copy">
+          Visiting a new city, meeting up with a friend, or just want a new
+          route? Simply choose a start point and a distance, hit enter, and
+          start running.
+        </p>
+      </header>
 
-    <!--
-      Simple controls: a slider picks a distance; the button will later trigger route generation.
-      The <label> ties the text to the slider for accessibility (clicking the label focuses the slider).
-    -->
-    <aside class="control-panel" role="region" aria-label="Route options">
-      <h1 class="app-title">Route Runner</h1>
-      <p class="hint">Click the map to set your start point, then generate a loop.</p>
+      <section class="map-frame" role="region" aria-label="Route options and map">
+        <div class="control-panel">
+          <p class="hint">
+            Choose a start point by clicking anywhere on the map.
+          </p>
 
-      <div class="field">
-        <label for="distance-slider">
-          Target distance:
-          <span id="distance-value" class="distance-readout">5 km</span>
-        </label>
-        <!--
-          type="range" is a native slider. min/max/step are in kilometers for now (easy to change later).
-          value is the starting position when the page loads.
-        -->
-        <input
-          id="distance-slider"
-          type="range"
-          min="1"
-          max="42"
-          step="0.5"
-          value="5"
-        />
-      </div>
+          <div class="field">
+            <label for="distance-slider">
+              Target distance:
+              <span id="distance-value" class="distance-readout">5 km</span>
+            </label>
+            <input
+              id="distance-slider"
+              type="range"
+              min="1"
+              max="42"
+              step="0.5"
+              value="5"
+            />
+          </div>
 
-      <button type="button" id="generate-btn" class="primary-btn">
-        Generate route
-      </button>
+          <button type="button" id="generate-btn" class="primary-btn">
+            Generate route
+          </button>
 
-      <!-- Filled by app.js after each successful route (aria-live helps screen readers) -->
-      <div id="route-stats" class="route-stats" hidden aria-live="polite">
-        <h2 class="stats-heading">Route summary</h2>
-        <ul class="stats-list">
-          <li>Total distance: <strong id="stat-distance">—</strong></li>
-          <li>Elevation gain: <strong id="stat-elevation-gain">—</strong></li>
-          <li>Elevation loss: <strong id="stat-elevation-loss">—</strong></li>
-          <li>Traffic signals (approx.): <strong id="stat-signals">—</strong></li>
-        </ul>
-      </div>
+          <!-- Filled by app.js after each successful route (aria-live helps screen readers) -->
+          <div id="route-stats" class="route-stats" hidden aria-live="polite">
+            <h2 class="stats-heading">Route summary</h2>
+            <ul class="stats-list">
+              <li>Total distance: <strong id="stat-distance">—</strong></li>
+              <li>Elevation gain: <strong id="stat-elevation-gain">—</strong></li>
+              <li>Elevation loss: <strong id="stat-elevation-loss">—</strong></li>
+              <li>Traffic signals (approx.): <strong id="stat-signals">—</strong></li>
+            </ul>
+          </div>
 
-      <p id="status-msg" class="status-msg" role="status"></p>
-    </aside>
+          <p id="status-msg" class="status-msg" role="status"></p>
+        </div>
+
+        <div id="map" aria-label="Interactive map"></div>
+      </section>
+    </main>
 
     <!--
       Leaflet JavaScript: must load before app.js because app.js will use the global `L` object.
