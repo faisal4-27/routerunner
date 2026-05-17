@@ -3,9 +3,10 @@
  *
  * Flow (high level):
  * 1) User clicks the map → we remember lat/lng and show one draggable marker.
- * 2) User clicks "Generate route" → we invent several "goal" points in a ring around the start,
- *    ask OSRM's Trip service for a running loop that visits them and returns to the start,
- *    then draw the path, count nearby traffic lights (Overpass), and estimate elevation (Open-Meteo).
+ * 2) User clicks "Generate route" → OSRM (`foot`) builds three road legs of roughly ¼ target each:
+ *    random initial heading, then ~90° right twice; a fourth leg routes back to the start. We
+ *    scale the first three leg targets so the full loop length is close to the slider distance,
+ *    then draw the path, count traffic lights (Overpass), and estimate elevation (Open-Meteo).
  */
 
 (function () {
@@ -13,7 +14,7 @@
 
   // --- Public OSRM demo server (no API key). For production you'd host your own OSRM. ---
   var OSRM_BASE = "https://router.project-osrm.org";
-  /** `foot` = pedestrian routing; matches a typical running use case. */
+  /** `foot` = pedestrian routing (roads, paths, sidewalks where mapped). */
   var OSRM_PROFILE = "foot";
 
   /** Overpass instance (community-run; be polite: one query per route, reasonable timeout). */
@@ -26,23 +27,25 @@
   var OPEN_METEO_ELEVATION_URL = "https://api.open-meteo.com/v1/elevation";
   var OPEN_METEO_MAX_POINTS_PER_REQUEST = 100;
 
-  /** How many "spokes" we place around your start (more = rounder loop, heavier OSRM work). */
-  var NUM_CANDIDATE_WAYPOINTS = 7;
-
-  /**
-   * We shrink the ring radius a bit because real paths are longer than straight lines.
-   * If routes are always too short vs the slider, nudge this up (e.g. 0.55).
-   */
-  var LOOP_RADIUS_FACTOR = 0.48;
-
   /** Search this many meters from sample points along the route when counting signals. */
   var SIGNAL_SEARCH_RADIUS_M = 35;
 
   /** Cap route vertices sent for elevation; batches use OPEN_METEO_MAX_POINTS_PER_REQUEST. */
   var ELEVATION_MAX_SAMPLES = 180;
+  var DIRECTION_ARROW_MIN_TURN_DEG = 20;
+  var DIRECTION_ARROW_MIN_SEGMENT_M = 25;
+  var OVERLAP_OFFSET_METERS = 4;
+  var ROUTE_HIGHLIGHT_METERS = 100;
+
+  /** Total loop length tolerance vs slider (meters or fraction of target). */
+  var LOOP_DISTANCE_TOL_M = 90;
+  var LOOP_DISTANCE_TOL_FRAC = 0.065;
 
   // --- Map setup (Leaflet creates a global `L`) ---
-  var map = L.map("map").setView([48.137, 11.575], 12);
+  var DEFAULT_CENTER = { lat: 43.4723, lng: -80.5449 }; // University of Waterloo fallback
+  var DEFAULT_ZOOM = 12;
+  var USER_LOCATION_ZOOM = 14;
+  var map = L.map("map").setView([DEFAULT_CENTER.lat, DEFAULT_CENTER.lng], DEFAULT_ZOOM);
 
   L.tileLayer("https://tiles.stadiamaps.com/tiles/outdoors/{z}/{x}/{y}{r}.png", {
     maxZoom: 20,
@@ -67,6 +70,50 @@
   var startPoint = null;
   /** @type {L.GeoJSON|null} Last polyline layer so we can remove it before drawing a new route. */
   var routeLayer = null;
+  /** @type {L.LayerGroup|null} Turn-direction arrow markers drawn on the route. */
+  var routeDirectionLayer = null;
+  /** @type {L.LayerGroup|null} Offset segments for opposite-direction overlaps. */
+  var routeOverlapLayer = null;
+  /** @type {L.LayerGroup|null} Start/end flags and highlighted route sections. */
+  var routeHighlightLayer = null;
+
+  function setStartPoint(lat, lng, shouldCenterMap) {
+    var ll = L.latLng(lat, lng);
+    startPoint = { lat: ll.lat, lng: ll.lng };
+
+    if (!startMarker) {
+      startMarker = L.marker(ll).addTo(map);
+    } else {
+      startMarker.setLatLng(ll);
+    }
+
+    if (shouldCenterMap) {
+      map.setView(ll, USER_LOCATION_ZOOM);
+    }
+  }
+
+  function initializeUserLocation() {
+    if (!navigator.geolocation) {
+      setStatus("Geolocation is unavailable. Map starts at the University of Waterloo.");
+      return;
+    }
+
+    setStatus("Trying to find your location...");
+    navigator.geolocation.getCurrentPosition(
+      function (pos) {
+        setStartPoint(pos.coords.latitude, pos.coords.longitude, true);
+        setStatus("Start point set to your current location. You can still click to move it.");
+      },
+      function () {
+        setStatus("Could not access your location. Map starts at the University of Waterloo.");
+      },
+      {
+        enableHighAccuracy: false,
+        timeout: 4000,
+        maximumAge: 300000,
+      }
+    );
+  }
 
   // ---------------------------------------------------------------------------
   // Small helpers (formatting, geometry, sampling)
@@ -111,27 +158,239 @@
     return { lat: (lat2 * 180) / Math.PI, lng: (lon2 * 180) / Math.PI };
   }
 
-  /**
-   * Evenly space bearings around the compass rose (0°, 51°, …) so waypoints form a ring.
-   */
-  function buildRingWaypoints(centerLat, centerLng, targetDistanceKm) {
-    var targetMeters = targetDistanceKm * 1000;
-    // Circumference ≈ 2πr; we want a rough loop length near `targetMeters`.
-    var radiusMeters = (targetMeters / (2 * Math.PI)) * LOOP_RADIUS_FACTOR;
-
-    var list = [];
-    for (var i = 0; i < NUM_CANDIDATE_WAYPOINTS; i++) {
-      var bearing = (360 / NUM_CANDIDATE_WAYPOINTS) * i;
-      list.push(offsetLatLng(centerLat, centerLng, radiusMeters, bearing));
-    }
-    return list;
+  function toOsrmCoord(lat, lng) {
+    return lng + "," + lat;
   }
 
   /**
-   * OSRM wants coordinates in the path as `lon,lat;lon,lat` (note the order vs Leaflet!).
+   * OSRM Route between two points. With `wantGeometry === false`, omits coordinates (smaller,
+   * faster) — use while tuning leg length; then call again with true for the final polyline.
    */
-  function toOsrmCoord(lat, lng) {
-    return lng + "," + lat;
+  function fetchOsrmRouteParsed(fromLat, fromLng, toLat, toLng, wantGeometry) {
+    if (wantGeometry === undefined) {
+      wantGeometry = true;
+    }
+    var coordPath = toOsrmCoord(fromLat, fromLng) + ";" + toOsrmCoord(toLat, toLng);
+    var params = new URLSearchParams({
+      geometries: "geojson",
+      steps: "false",
+      continue_straight: "false",
+    });
+    params.set("overview", wantGeometry ? "full" : "false");
+    var url =
+      OSRM_BASE + "/route/v1/" + OSRM_PROFILE + "/" + coordPath + "?" + params.toString();
+    return fetch(url).then(function (res) {
+      if (!res.ok) {
+        throw new Error("OSRM HTTP " + res.status);
+      }
+      return res.json();
+    }).then(function (data) {
+      if (data.code !== "Ok" || !data.routes || !data.routes.length) {
+        throw new Error(data.message || "OSRM could not find a path between these points.");
+      }
+      var route = data.routes[0];
+      var coords = null;
+      if (wantGeometry) {
+        if (!route.geometry || route.geometry.type !== "LineString") {
+          throw new Error("Unexpected geometry from OSRM.");
+        }
+        coords = route.geometry.coordinates;
+      }
+      return {
+        distanceMeters: route.distance,
+        coordinates: coords,
+      };
+    });
+  }
+
+  function lastCoordLatLng(coordsLngLat) {
+    var p = coordsLngLat[coordsLngLat.length - 1];
+    return { lat: p[1], lng: p[0] };
+  }
+
+  function routeEndBearingDeg(coordsLngLat) {
+    if (!coordsLngLat || coordsLngLat.length < 2) {
+      return 0;
+    }
+    var n = coordsLngLat.length;
+    return segmentBearingDeg(coordsLngLat[n - 2], coordsLngLat[n - 1]);
+  }
+
+  function appendLineStringCoords(baseLngLat, extLngLat) {
+    if (!extLngLat || !extLngLat.length) {
+      return baseLngLat.slice();
+    }
+    if (!baseLngLat || !baseLngLat.length) {
+      return extLngLat.slice();
+    }
+    var out = baseLngLat.slice();
+    var firstExt = extLngLat[0];
+    var lastBase = out[out.length - 1];
+    var startIdx =
+      approxDistanceMeters(lastBase, firstExt) < 6 ? 1 : 0;
+    for (var i = startIdx; i < extLngLat.length; i++) {
+      out.push(extLngLat[i]);
+    }
+    return out;
+  }
+
+  /**
+   * Finds a road route from `start` toward `bearingDeg` whose *routed* length is near
+   * `targetMeters`, by binary-searching the crow-flight hint distance. Tuning uses distance-only
+   * OSRM calls (`overview=false`); one final call returns full geometry for that hint.
+   */
+  function findRoadLegAlongBearing(startLat, startLng, bearingDeg, targetMeters) {
+    var legTol = Math.max(65, targetMeters * 0.14);
+    var maxCrow = Math.min(32000, Math.max(1800, targetMeters * 5.5));
+
+    function routeDistanceAtCrow(crowMeters) {
+      var e = offsetLatLng(startLat, startLng, crowMeters, bearingDeg);
+      return fetchOsrmRouteParsed(startLat, startLng, e.lat, e.lng, false).then(function (parsed) {
+        return {
+          crowMeters: crowMeters,
+          distanceMeters: parsed.distanceMeters,
+        };
+      });
+    }
+
+    function finalizeLeg(crowMeters) {
+      var e = offsetLatLng(startLat, startLng, crowMeters, bearingDeg);
+      return fetchOsrmRouteParsed(startLat, startLng, e.lat, e.lng, true).then(function (parsed) {
+        return {
+          distanceMeters: parsed.distanceMeters,
+          coordinates: parsed.coordinates,
+        };
+      });
+    }
+
+    var hiCrow = Math.max(120, targetMeters * 0.28);
+    var expandCount = 0;
+
+    function expandHi() {
+      return routeDistanceAtCrow(hiCrow).then(function (rec) {
+        if (rec.distanceMeters >= targetMeters - legTol * 0.45) {
+          return hiCrow;
+        }
+        expandCount++;
+        if (expandCount > 18 || hiCrow >= maxCrow * 0.998) {
+          throw new Error(
+            "Could not extend far enough along roads in this direction. Try another start or distance."
+          );
+        }
+        hiCrow = Math.min(maxCrow, hiCrow * 1.45);
+        return expandHi();
+      });
+    }
+
+    return expandHi().then(function (hiBracketCrow) {
+      var loR = 28;
+      var hiR = hiBracketCrow;
+      var best = null;
+      var bisectCount = 0;
+
+      function oneBisect() {
+        if (bisectCount++ > 14) {
+          if (best) {
+            return Promise.resolve(best.crowMeters);
+          }
+          throw new Error("OSRM could not tune leg distance.");
+        }
+        var mid = (loR + hiR) / 2;
+        return routeDistanceAtCrow(mid).then(function (rec) {
+          var d = rec.distanceMeters;
+          if (
+            !best ||
+            Math.abs(d - targetMeters) < Math.abs(best.distanceMeters - targetMeters)
+          ) {
+            best = rec;
+          }
+          if (Math.abs(d - targetMeters) <= legTol) {
+            return Promise.resolve(rec.crowMeters);
+          }
+          if (d > targetMeters) {
+            hiR = mid;
+          } else {
+            loR = mid;
+          }
+          return oneBisect();
+        });
+      }
+
+      return routeDistanceAtCrow(loR).then(function (loRec) {
+        if (loRec.distanceMeters >= targetMeters + legTol) {
+          loR = 10;
+        }
+        return oneBisect();
+      });
+    }).then(function (chosenCrowMeters) {
+      return finalizeLeg(chosenCrowMeters);
+    });
+  }
+
+  /**
+   * Three road legs (~¼ target each, scaled), two right turns, then OSRM return to start.
+   * Adjusts leg scale so d1+d2+d3+d4 ≈ target (leg 4 length follows geometry).
+   */
+  function buildRoadFollowingRightTurnLoop(startLat, startLng, targetDistanceKm) {
+    var targetMeters = targetDistanceKm * 1000;
+    var tolTotal = Math.max(LOOP_DISTANCE_TOL_M, targetMeters * LOOP_DISTANCE_TOL_FRAC);
+    var bearing0 = Math.random() * 360;
+    var legScale = 1;
+    var outerMax = 7;
+
+    function oneLoop(outerIdx) {
+      var legTarget = (targetMeters / 4) * legScale;
+
+      return findRoadLegAlongBearing(startLat, startLng, bearing0, legTarget)
+        .then(function (leg1) {
+          var end1 = lastCoordLatLng(leg1.coordinates);
+          var b2 = routeEndBearingDeg(leg1.coordinates) + 90;
+          return findRoadLegAlongBearing(end1.lat, end1.lng, b2, legTarget).then(function (leg2) {
+            var end2 = lastCoordLatLng(leg2.coordinates);
+            var b3 = routeEndBearingDeg(leg2.coordinates) + 90;
+            return findRoadLegAlongBearing(end2.lat, end2.lng, b3, legTarget).then(function (leg3) {
+              var end3 = lastCoordLatLng(leg3.coordinates);
+              return fetchOsrmRouteParsed(
+                end3.lat,
+                end3.lng,
+                startLat,
+                startLng
+              ).then(function (leg4) {
+                var total =
+                  leg1.distanceMeters +
+                  leg2.distanceMeters +
+                  leg3.distanceMeters +
+                  leg4.distanceMeters;
+                var err = targetMeters - total;
+
+                if (Math.abs(err) <= tolTotal || outerIdx + 1 >= outerMax) {
+                  var coords = appendLineStringCoords(
+                    leg1.coordinates,
+                    appendLineStringCoords(
+                      leg2.coordinates,
+                      appendLineStringCoords(leg3.coordinates, leg4.coordinates)
+                    )
+                  );
+                  return {
+                    geometry: { type: "LineString", coordinates: coords },
+                    distanceMeters: total,
+                  };
+                }
+
+                legScale *= 1 + (err / targetMeters) * 0.52;
+                if (legScale < 0.32) {
+                  legScale = 0.32;
+                } else if (legScale > 2.35) {
+                  legScale = 2.35;
+                }
+                return oneLoop(outerIdx + 1);
+              });
+            });
+          });
+        });
+    }
+
+    return oneLoop(0);
   }
 
   /**
@@ -167,36 +426,365 @@
     return Math.round(m) + " m";
   }
 
-  // ---------------------------------------------------------------------------
-  // OSRM Trip: build a loop through the ring waypoints and back to the start
-  // ---------------------------------------------------------------------------
+  function normalizeBearingDeg(bearing) {
+    var b = bearing % 360;
+    return b < 0 ? b + 360 : b;
+  }
 
-  /**
-   * Calls OSRM Trip. With default `roundtrip=true`, the route leaves the first coordinate,
-   * visits the others in a good order, then returns to the first coordinate.
-   */
-  function fetchOsrmTrip(startLat, startLng, waypointsLatLng) {
-    var parts = [toOsrmCoord(startLat, startLng)];
-    for (var i = 0; i < waypointsLatLng.length; i++) {
-      var w = waypointsLatLng[i];
-      parts.push(toOsrmCoord(w.lat, w.lng));
+  function segmentBearingDeg(fromLngLat, toLngLat) {
+    var fromLng = fromLngLat[0];
+    var fromLat = fromLngLat[1];
+    var toLng = toLngLat[0];
+    var toLat = toLngLat[1];
+    var latRad = ((fromLat + toLat) / 2) * (Math.PI / 180);
+    var dx = (toLng - fromLng) * Math.cos(latRad);
+    var dy = toLat - fromLat;
+    var bearing = (Math.atan2(dx, dy) * 180) / Math.PI;
+    return normalizeBearingDeg(bearing);
+  }
+
+  function bearingDeltaDeg(a, b) {
+    var d = Math.abs(a - b) % 360;
+    return d > 180 ? 360 - d : d;
+  }
+
+  function approxDistanceMeters(aLngLat, bLngLat) {
+    var dLat = (bLngLat[1] - aLngLat[1]) * 111320;
+    var avgLatRad = ((aLngLat[1] + bLngLat[1]) / 2) * (Math.PI / 180);
+    var dLng = (bLngLat[0] - aLngLat[0]) * 111320 * Math.cos(avgLatRad);
+    return Math.sqrt(dLat * dLat + dLng * dLng);
+  }
+
+  function clearRouteVisuals() {
+    if (routeLayer) {
+      map.removeLayer(routeLayer);
+      routeLayer = null;
     }
-    var coordPath = parts.join(";");
+    if (routeDirectionLayer) {
+      map.removeLayer(routeDirectionLayer);
+      routeDirectionLayer = null;
+    }
+    if (routeOverlapLayer) {
+      map.removeLayer(routeOverlapLayer);
+      routeOverlapLayer = null;
+    }
+    if (routeHighlightLayer) {
+      map.removeLayer(routeHighlightLayer);
+      routeHighlightLayer = null;
+    }
+  }
 
-    var params = new URLSearchParams({
-      roundtrip: "true",
-      geometries: "geojson",
-      overview: "full",
-      steps: "false",
-    });
+  function midpointLngLat(aLngLat, bLngLat) {
+    return [(aLngLat[0] + bLngLat[0]) / 2, (aLngLat[1] + bLngLat[1]) / 2];
+  }
 
-    var url = OSRM_BASE + "/trip/v1/" + OSRM_PROFILE + "/" + coordPath + "?" + params.toString();
-    return fetch(url).then(function (res) {
-      if (!res.ok) {
-        throw new Error("OSRM HTTP " + res.status);
+  function interpolateLngLat(aLngLat, bLngLat, t) {
+    return [
+      aLngLat[0] + (bLngLat[0] - aLngLat[0]) * t,
+      aLngLat[1] + (bLngLat[1] - aLngLat[1]) * t,
+    ];
+  }
+
+  function toLeafletLine(coordsLngLat) {
+    var out = [];
+    for (var i = 0; i < coordsLngLat.length; i++) {
+      out.push([coordsLngLat[i][1], coordsLngLat[i][0]]);
+    }
+    return out;
+  }
+
+  function buildPrefixCoordsByDistance(coordsLngLat, distanceMeters) {
+    if (!Array.isArray(coordsLngLat) || !coordsLngLat.length) {
+      return [];
+    }
+    var out = [coordsLngLat[0]];
+    var remaining = Math.max(0, distanceMeters);
+
+    for (var i = 0; i < coordsLngLat.length - 1 && remaining > 0; i++) {
+      var a = coordsLngLat[i];
+      var b = coordsLngLat[i + 1];
+      var segLen = approxDistanceMeters(a, b);
+      if (segLen <= 0) {
+        continue;
       }
-      return res.json();
+      if (segLen <= remaining) {
+        out.push(b);
+        remaining -= segLen;
+      } else {
+        out.push(interpolateLngLat(a, b, remaining / segLen));
+        remaining = 0;
+      }
+    }
+    return out;
+  }
+
+  function buildSuffixCoordsByDistance(coordsLngLat, distanceMeters) {
+    if (!Array.isArray(coordsLngLat) || !coordsLngLat.length) {
+      return [];
+    }
+    var outReversed = [coordsLngLat[coordsLngLat.length - 1]];
+    var remaining = Math.max(0, distanceMeters);
+
+    for (var i = coordsLngLat.length - 1; i > 0 && remaining > 0; i--) {
+      var a = coordsLngLat[i];
+      var b = coordsLngLat[i - 1];
+      var segLen = approxDistanceMeters(a, b);
+      if (segLen <= 0) {
+        continue;
+      }
+      if (segLen <= remaining) {
+        outReversed.push(b);
+        remaining -= segLen;
+      } else {
+        outReversed.push(interpolateLngLat(a, b, remaining / segLen));
+        remaining = 0;
+      }
+    }
+    return outReversed.reverse();
+  }
+
+  function drawStartEndHighlights(coordsLngLat) {
+    if (!Array.isArray(coordsLngLat) || coordsLngLat.length < 2) {
+      return;
+    }
+    routeHighlightLayer = L.layerGroup().addTo(map);
+
+    var start = coordsLngLat[0];
+    var end = coordsLngLat[coordsLngLat.length - 1];
+    var endForMarker = end;
+    if (approxDistanceMeters(start, end) < 3) {
+      endForMarker = [end[0] + 0.00012, end[1]];
+    }
+
+    L.marker([start[1], start[0]], {
+      interactive: false,
+      keyboard: false,
+      icon: L.divIcon({
+        className: "start-flag-icon",
+        html:
+          '<div style="display:flex; align-items:flex-end; gap:2px;">' +
+          '<div style="width:2px; height:18px; background:#2e2e2e;"></div>' +
+          '<div style="width:0; height:0; border-top:6px solid transparent; border-bottom:6px solid transparent; border-left:12px solid #1b8f2e;"></div>' +
+          "</div>",
+        iconSize: [16, 20],
+        iconAnchor: [2, 18],
+      }),
+    }).addTo(routeHighlightLayer);
+
+    L.marker([endForMarker[1], endForMarker[0]], {
+      interactive: false,
+      keyboard: false,
+      icon: L.divIcon({
+        className: "finish-flag-icon",
+        html: '<div style="font-size:18px; line-height:18px;">🏁</div>',
+        iconSize: [18, 18],
+        iconAnchor: [9, 16],
+      }),
+    }).addTo(routeHighlightLayer);
+
+    var firstChunk = buildPrefixCoordsByDistance(coordsLngLat, ROUTE_HIGHLIGHT_METERS);
+    if (firstChunk.length >= 2) {
+      L.polyline(toLeafletLine(firstChunk), {
+        color: "#2e7d32",
+        weight: 7,
+        opacity: 0.95,
+        interactive: false,
+      }).addTo(routeHighlightLayer);
+    }
+
+    var lastChunk = buildSuffixCoordsByDistance(coordsLngLat, ROUTE_HIGHLIGHT_METERS);
+    if (lastChunk.length >= 2) {
+      var lastLeaflet = toLeafletLine(lastChunk);
+      L.polyline(lastLeaflet, {
+        color: "#111111",
+        weight: 7,
+        opacity: 0.95,
+        dashArray: "12 12",
+        dashOffset: "0",
+        interactive: false,
+      }).addTo(routeHighlightLayer);
+      L.polyline(lastLeaflet, {
+        color: "#ffffff",
+        weight: 7,
+        opacity: 0.95,
+        dashArray: "12 12",
+        dashOffset: "12",
+        interactive: false,
+      }).addTo(routeHighlightLayer);
+    }
+  }
+
+  function offsetPointLngLat(lngLat, normalX, normalY, meters) {
+    var lat = lngLat[1];
+    var metersPerDegLat = 111320;
+    var metersPerDegLng = 111320 * Math.cos((lat * Math.PI) / 180);
+    var dLng = (normalX * meters) / Math.max(metersPerDegLng, 1e-6);
+    var dLat = (normalY * meters) / metersPerDegLat;
+    return [lngLat[0] + dLng, lat + dLat];
+  }
+
+  function buildSegmentKey(aLngLat, bLngLat) {
+    var ax = aLngLat[0].toFixed(6);
+    var ay = aLngLat[1].toFixed(6);
+    var bx = bLngLat[0].toFixed(6);
+    var by = bLngLat[1].toFixed(6);
+    var forward = ax + "," + ay + "|" + bx + "," + by;
+    var reverse = bx + "," + by + "|" + ax + "," + ay;
+    return forward < reverse
+      ? { undirected: forward, direction: 1 }
+      : { undirected: reverse, direction: -1 };
+  }
+
+  function drawOppositeDirectionOffsets(coordsLngLat) {
+    if (!Array.isArray(coordsLngLat) || coordsLngLat.length < 2) {
+      return;
+    }
+    var seenDirectionsByKey = {};
+    routeOverlapLayer = L.layerGroup().addTo(map);
+
+    for (var i = 0; i < coordsLngLat.length - 1; i++) {
+      var a = coordsLngLat[i];
+      var b = coordsLngLat[i + 1];
+      var len = approxDistanceMeters(a, b);
+      if (len < DIRECTION_ARROW_MIN_SEGMENT_M) {
+        continue;
+      }
+
+      var keyInfo = buildSegmentKey(a, b);
+      var seen = seenDirectionsByKey[keyInfo.undirected];
+      if (!seen) {
+        seenDirectionsByKey[keyInfo.undirected] = keyInfo.direction;
+        continue;
+      }
+      if (seen === keyInfo.direction) {
+        continue;
+      }
+
+      var dx = b[0] - a[0];
+      var dy = b[1] - a[1];
+      var mag = Math.sqrt(dx * dx + dy * dy);
+      if (mag < 1e-12) {
+        continue;
+      }
+      var normalX = (-dy / mag) * keyInfo.direction;
+      var normalY = (dx / mag) * keyInfo.direction;
+      var aOffset = offsetPointLngLat(a, normalX, normalY, OVERLAP_OFFSET_METERS);
+      var bOffset = offsetPointLngLat(b, normalX, normalY, OVERLAP_OFFSET_METERS);
+
+      L.polyline(
+        [
+          [aOffset[1], aOffset[0]],
+          [bOffset[1], bOffset[0]],
+        ],
+        {
+          color: "#42a5f5",
+          weight: 3,
+          opacity: 0.95,
+          interactive: false,
+        }
+      ).addTo(routeOverlapLayer);
+    }
+  }
+
+  function drawDirectionArrows(coordsLngLat) {
+    if (!Array.isArray(coordsLngLat) || coordsLngLat.length < 2) {
+      return;
+    }
+
+    var segments = [];
+    for (var i = 0; i < coordsLngLat.length - 1; i++) {
+      var from = coordsLngLat[i];
+      var to = coordsLngLat[i + 1];
+      var segLen = approxDistanceMeters(from, to);
+      if (segLen <= 0) {
+        continue;
+      }
+      segments.push({
+        from: from,
+        to: to,
+        length: segLen,
+        bearing: segmentBearingDeg(from, to),
+      });
+    }
+    if (!segments.length) {
+      return;
+    }
+
+    function pointAtDistanceOnRun(startSegIdx, endSegIdx, targetDistanceM) {
+      var acc = 0;
+      for (var s = startSegIdx; s <= endSegIdx; s++) {
+        var seg = segments[s];
+        if (acc + seg.length >= targetDistanceM) {
+          var localT = (targetDistanceM - acc) / seg.length;
+          return {
+            point: interpolateLngLat(seg.from, seg.to, localT),
+            bearing: seg.bearing,
+          };
+        }
+        acc += seg.length;
+      }
+      var lastSeg = segments[endSegIdx];
+      return {
+        point: midpointLngLat(lastSeg.from, lastSeg.to),
+        bearing: lastSeg.bearing,
+      };
+    }
+
+    var runs = [];
+    var runStart = 0;
+    var runLength = segments[0].length;
+    var runBearing = segments[0].bearing;
+
+    for (var j = 1; j < segments.length; j++) {
+      var segJ = segments[j];
+      var isTurn = bearingDeltaDeg(runBearing, segJ.bearing) >= DIRECTION_ARROW_MIN_TURN_DEG;
+      if (isTurn) {
+        runs.push({
+          startIdx: runStart,
+          endIdx: j - 1,
+          length: runLength,
+        });
+        runStart = j;
+        runLength = segJ.length;
+        runBearing = segJ.bearing;
+      } else {
+        runLength += segJ.length;
+        runBearing = segJ.bearing;
+      }
+    }
+    runs.push({
+      startIdx: runStart,
+      endIdx: segments.length - 1,
+      length: runLength,
     });
+
+    routeDirectionLayer = L.layerGroup().addTo(map);
+
+    for (var r = 0; r < runs.length; r++) {
+      var run = runs[r];
+      if (run.length < DIRECTION_ARROW_MIN_SEGMENT_M) {
+        continue;
+      }
+      var arrowAt = pointAtDistanceOnRun(run.startIdx, run.endIdx, run.length / 2);
+      var rotationDeg = arrowAt.bearing - 90;
+
+      L.marker([arrowAt.point[1], arrowAt.point[0]], {
+        interactive: false,
+        keyboard: false,
+        icon: L.divIcon({
+          className: "direction-arrow-icon",
+          html:
+            '<svg width="18" height="18" viewBox="0 0 18 18" ' +
+            'style="transform: rotate(' +
+            rotationDeg +
+            'deg); transform-origin: center center; opacity: 0.95;">' +
+            '<path d="M3 4 L11 9 L3 14" stroke="#111111" stroke-width="3" fill="none" ' +
+            'stroke-linecap="round" stroke-linejoin="round"></path></svg>',
+          iconSize: [18, 18],
+          iconAnchor: [9, 9],
+        }),
+      }).addTo(routeDirectionLayer);
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -367,10 +955,7 @@
   // ---------------------------------------------------------------------------
 
   function drawRoute(geojsonLineString) {
-    if (routeLayer) {
-      map.removeLayer(routeLayer);
-      routeLayer = null;
-    }
+    clearRouteVisuals();
     routeLayer = L.geoJSON(
       {
         type: "Feature",
@@ -385,6 +970,9 @@
         },
       }
     ).addTo(map);
+    drawStartEndHighlights(geojsonLineString.coordinates);
+    drawOppositeDirectionOffsets(geojsonLineString.coordinates);
+    drawDirectionArrows(geojsonLineString.coordinates);
 
     try {
       map.fitBounds(routeLayer.getBounds(), { padding: [36, 36], maxZoom: 16 });
@@ -415,16 +1003,7 @@
 
   map.on("click", function (ev) {
     var ll = ev.latlng;
-    startPoint = { lat: ll.lat, lng: ll.lng };
-
-    if (!startMarker) {
-      // First click: create the marker. `addTo(map)` puts it on the map layer.
-      startMarker = L.marker(ll).addTo(map);
-    } else {
-      // Later clicks: reuse the same marker object so only one exists.
-      startMarker.setLatLng(ll);
-    }
-
+    setStartPoint(ll.lat, ll.lng, false);
     setStatus("Start point set. Adjust distance if you like, then generate.");
   });
 
@@ -446,24 +1025,30 @@
     setStatus("Building route…");
     generateBtn.disabled = true;
 
-    var ring = buildRingWaypoints(startPoint.lat, startPoint.lng, targetKm);
+    function buildWithBearingRetries() {
+      var tries = 0;
+      function attempt() {
+        return buildRoadFollowingRightTurnLoop(
+          startPoint.lat,
+          startPoint.lng,
+          targetKm
+        ).catch(function (err) {
+          tries++;
+          if (tries < 4) {
+            return attempt();
+          }
+          throw err;
+        });
+      }
+      return attempt();
+    }
 
-    fetchOsrmTrip(startPoint.lat, startPoint.lng, ring)
-      .then(function (data) {
-        if (data.code !== "Ok" || !data.trips || !data.trips.length) {
-          throw new Error(
-            data.message || "OSRM could not build a trip for these points."
-          );
-        }
-        var trip = data.trips[0];
-        if (!trip.geometry || trip.geometry.type !== "LineString") {
-          throw new Error("Unexpected geometry from OSRM.");
-        }
+    buildWithBearingRetries()
+      .then(function (built) {
+        drawRoute(built.geometry);
 
-        drawRoute(trip.geometry);
-
-        var coords = trip.geometry.coordinates;
-        var distanceMeters = trip.distance;
+        var coords = built.geometry.coordinates;
+        var distanceMeters = built.distanceMeters;
 
         return Promise.all([
           Promise.resolve(distanceMeters),
@@ -497,10 +1082,7 @@
         console.error(err);
         setStatus(err.message || "Something went wrong building the route.", true);
         routeStatsEl.hidden = true;
-        if (routeLayer) {
-          map.removeLayer(routeLayer);
-          routeLayer = null;
-        }
+        clearRouteVisuals();
       })
       .finally(function () {
         generateBtn.disabled = false;
@@ -516,5 +1098,7 @@
     }
   });
 
-  setStatus("Click the map to choose a starting point, then press Enter or generate.");
+  setTimeout(function () {
+    initializeUserLocation();
+  }, 0);
 })();
