@@ -16,10 +16,40 @@ A web app that generates running routes based on a selected location and distanc
 - OpenTopoData
 
 ## Getting Started
-Instructions for how to run the project locally will go here.
+
+### One command (frontend + backend)
+
+From the project root, install backend dependencies once:
+
+```bash
+pip install -r backend/requirements.txt
+```
+
+Then start everything:
+
+```bash
+python run.py
+```
+
+Open **http://127.0.0.1:3001** in your browser. Press **Ctrl+C** in the terminal to stop both servers.
+
+### Run separately (optional)
+
+**Backend** (from `backend/`):
+
+```bash
+cd backend
+uvicorn app.main:app --reload --port 8000
+```
+
+**Frontend** (from project root, port 3001 matches CORS in the API):
+
+```bash
+python -m http.server 3001 --bind 127.0.0.1
+```
 
 ## Roadmap
 - [ ] React frontend
-- [ ] Python backend
-- [ ] Traffic signal minimization
+- [x] Python backend
+- [x] Traffic signal minimization
 - [ ] Elevation chart
