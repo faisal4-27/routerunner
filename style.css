@@ -83,6 +83,54 @@ body {
   width: 100%;
 }
 
+.distance-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+}
+
+.distance-controls #distance-slider {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.distance-input {
+  flex: 0 0 4.5rem;
+  width: 4.5rem;
+  padding: 0.38rem 0.45rem;
+  font: inherit;
+  font-size: 0.92rem;
+  color: #1f2630;
+  background: #fff;
+  border: 1px solid #c5cee0;
+  border-radius: 6px;
+  text-align: right;
+  -moz-appearance: textfield;
+}
+
+.distance-input::-webkit-outer-spin-button,
+.distance-input::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+.distance-input:focus-visible {
+  outline: 2px solid #fc4c02;
+  outline-offset: 1px;
+  border-color: #fc4c02;
+}
+
+.distance-input.invalid {
+  border-color: #c62828;
+  background: #fff5f5;
+}
+
+.distance-unit {
+  flex: 0 0 auto;
+  font-size: 0.88rem;
+  color: #47556f;
+}
+
 .primary-btn {
   width: 170px;
   padding: 0.62rem 0.9rem;

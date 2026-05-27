@@ -12,7 +12,7 @@ double-back avoidance.
 from __future__ import annotations
 
 import os
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
 
 import httpx
 
@@ -75,3 +75,66 @@ async def fetch_osrm_route(
         coords = [list(c) for c in geometry["coordinates"]]
 
     return distance, coords
+
+
+async def fetch_osrm_route_through_points(
+    client: httpx.AsyncClient,
+    points: Sequence[Tuple[float, float]],
+    *,
+    want_geometry: bool = True,
+) -> dict[str, Any]:
+    """
+    Route through an ordered list of (lat, lng) points in a single OSRM call.
+
+    Returning per-leg distances from one request is much cheaper than firing
+    one HTTP call per leg — fewer round-trips, one OSRM routing context, and
+    `continue_straight=true` is enforced consistently across every via point.
+
+    Pass `want_geometry=False` for fast distance-only tuning calls; the
+    response payload shrinks dramatically when OSRM doesn't have to
+    serialize the full polyline.
+
+    Returns a dict with:
+        "leg_distances"   — list of per-leg distances in metres (len = len(points)-1)
+        "total_distance"  — sum of leg distances in metres
+        "coordinates"     — combined [lng, lat] polyline, or None if no geometry requested
+    """
+    if len(points) < 2:
+        raise OsrmError("Need at least two points to build a route.")
+
+    coord_str = ";".join(f"{lng},{lat}" for lat, lng in points)
+    params: dict[str, str] = {
+        "geometries": "geojson",
+        "steps": "false",
+        "continue_straight": "true",
+        "annotations": "false",
+        "overview": "full" if want_geometry else "false",
+    }
+    url = f"{OSRM_BASE}/route/v1/{OSRM_PROFILE}/{coord_str}"
+
+    response = await client.get(url, params=params, timeout=45.0)
+    if response.status_code != 200:
+        raise OsrmError(f"OSRM HTTP {response.status_code}")
+
+    data = response.json()
+    if data.get("code") != "Ok" or not data.get("routes"):
+        raise OsrmError(
+            data.get("message", "OSRM could not build a route through these points.")
+        )
+
+    route = data["routes"][0]
+    leg_distances = [float(leg["distance"]) for leg in route.get("legs", [])]
+    total_distance = float(route["distance"])
+
+    coordinates: Optional[List[LngLat]] = None
+    if want_geometry:
+        geometry = route.get("geometry") or {}
+        if geometry.get("type") != "LineString":
+            raise OsrmError("Unexpected geometry type from OSRM.")
+        coordinates = [list(c) for c in geometry["coordinates"]]
+
+    return {
+        "leg_distances": leg_distances,
+        "total_distance": total_distance,
+        "coordinates": coordinates,
+    }

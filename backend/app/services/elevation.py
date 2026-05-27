@@ -7,6 +7,7 @@ total elevation gain and loss.
 
 from __future__ import annotations
 
+import asyncio
 import os
 from typing import List, Sequence, Tuple
 
@@ -66,14 +67,25 @@ async def fetch_elevations_along_route(
 ) -> Tuple[float, float]:
     """
     Sample the route, fetch elevation in batches of 100, return (gain_m, loss_m).
+
+    Batches are fired concurrently because Open-Meteo handles independent
+    requests in parallel — for a typical loop this turns 2 sequential API
+    calls into 1 round-trip's worth of wall time.
+
     Returns (0, 0) if the API returns too few usable points.
     """
     sampled = sample_line_coords(coords, ELEVATION_MAX_SAMPLES)
-    all_elev: List[float] = []
 
-    for i in range(0, len(sampled), MAX_POINTS_PER_REQUEST):
-        batch = sampled[i : i + MAX_POINTS_PER_REQUEST]
-        batch_elev = await fetch_elevations_batch(client, batch)
+    batches = [
+        sampled[i : i + MAX_POINTS_PER_REQUEST]
+        for i in range(0, len(sampled), MAX_POINTS_PER_REQUEST)
+    ]
+    results = await asyncio.gather(
+        *(fetch_elevations_batch(client, batch) for batch in batches)
+    )
+
+    all_elev: List[float] = []
+    for batch_elev in results:
         all_elev.extend(batch_elev)
 
     if len(all_elev) < 2:

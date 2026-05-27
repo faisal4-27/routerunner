@@ -1,20 +1,21 @@
 """
-Generates a single running loop by stitching together 5 OSRM legs.
+Generates a single running loop close to the user's target distance.
 
 How it works:
 1. Place the start point on the circumference of a circle whose
    circumference equals the requested distance.
 2. Place 4 additional waypoints at 72° intervals around the same circle so
    all 5 points sit on the circumference.
-3. Route each consecutive pair with OSRM's `route` endpoint (foot profile),
-   concatenating the legs into one polyline.
+3. Route through all 5 points + back to start in a single OSRM call (foot
+   profile, continue_straight=true). Tuning iterations use overview=false
+   so OSRM doesn't have to serialize the polyline every time.
 4. Compare the total routed distance against the target; if it's outside
    ±8 %, push each waypoint inward or outward, weighted by how off its own
    leg was, and rebuild. Up to 6 distance iterations per layout.
-5. If the resulting loop reuses any streets in both directions, rotate the
-   whole circle by a random 15–40° and rebuild. Up to 4 layouts in total,
-   keeping the cleanest result we saw.
-6. Enrich the chosen route with traffic-signal and elevation data.
+5. Fetch the polyline once for the layout we settle on. If it reuses any
+   streets in both directions, rotate the whole circle by a random 15–40°
+   and rebuild. Up to 4 layouts in total, keeping the cleanest result we saw.
+6. Enrich the chosen route with traffic-signal and elevation data in parallel.
 """
 
 from __future__ import annotations
@@ -28,11 +29,10 @@ import httpx
 
 from app.models.schemas import RouteCandidate
 from app.services.elevation import fetch_elevations_along_route
-from app.services.osrm import OsrmError, fetch_osrm_route
+from app.services.osrm import OsrmError, fetch_osrm_route_through_points
 from app.services.overpass import count_traffic_signals
 from app.utils.geo import (
     LngLat,
-    append_line_string_coords,
     count_double_back_segments,
     offset_lat_lng,
 )
@@ -89,45 +89,9 @@ def _build_waypoints(
     return points
 
 
-async def _route_through_points(
-    client: httpx.AsyncClient,
-    points: Sequence[Tuple[float, float]],
-) -> Tuple[List[LngLat], List[float], float]:
-    """
-    Route every consecutive pair of points and close the loop back to the start.
-
-    All 5 leg requests fly to OSRM concurrently — each round-trip dominates
-    the call, so parallelising them roughly cuts wall time by 5×. The results
-    are reassembled in the original waypoint order so the polyline keeps the
-    same orientation as the loop.
-
-    Returns (combined_coords, per_leg_distances, total_distance).
-    """
-    count = len(points)
-
-    async def _leg(i: int) -> Tuple[float, List[LngLat] | None]:
-        from_lat, from_lng = points[i]
-        to_lat, to_lng = points[(i + 1) % count]
-        return await fetch_osrm_route(
-            client,
-            from_lat=from_lat,
-            from_lng=from_lng,
-            to_lat=to_lat,
-            to_lng=to_lng,
-            want_geometry=True,
-        )
-
-    results = await asyncio.gather(*(_leg(i) for i in range(count)))
-
-    leg_distances: List[float] = []
-    combined: List[LngLat] = []
-    for distance, coords in results:
-        if coords is None:
-            raise OsrmError("OSRM returned no geometry for a leg.")
-        leg_distances.append(distance)
-        combined = append_line_string_coords(combined, coords)
-
-    return combined, leg_distances, sum(leg_distances)
+def _closed_loop(points: Sequence[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    """Append the first point to the end so OSRM routes back to the start."""
+    return list(points) + [points[0]]
 
 
 def _adjust_scales(
@@ -229,18 +193,21 @@ async def generate_route(
     rotation_deg = random.uniform(0.0, 360.0)
 
     async with httpx.AsyncClient() as client:
-        for outer in range(ROTATION_ATTEMPTS):
+        for _ in range(ROTATION_ATTEMPTS):
             scales = [1.0] * NUM_POINTS
-            inner_last: Tuple[List[LngLat], float] | None = None
+            chosen_points: List[Tuple[float, float]] | None = None
 
+            # Tuning loop: ask OSRM for distances only (overview=false) — the
+            # payload is dramatically smaller than the polyline version, so
+            # iteration is much faster. Geometry is fetched once at the end.
             for _ in range(DISTANCE_ITERATIONS):
                 points = _build_waypoints(
                     lat, lng, base_radius_m, rotation_deg, scales
                 )
 
                 try:
-                    coords, leg_distances, total_m = await _route_through_points(
-                        client, points
+                    result = await fetch_osrm_route_through_points(
+                        client, _closed_loop(points), want_geometry=False
                     )
                 except OsrmError as exc:
                     # Transient OSRM trouble — widen the circle and try again.
@@ -248,15 +215,30 @@ async def generate_route(
                     base_radius_m *= 1.1
                     continue
 
-                inner_last = (coords, total_m)
+                leg_distances = result["leg_distances"]
+                total_m = result["total_distance"]
+                chosen_points = points
 
                 if abs(target_m - total_m) <= tolerance_m:
                     break
 
                 scales = _adjust_scales(scales, leg_distances, target_m)
 
-            if inner_last is not None:
-                coords, total_m = inner_last
+            if chosen_points is not None:
+                # One geometry fetch for the layout we settled on.
+                try:
+                    final_result = await fetch_osrm_route_through_points(
+                        client, _closed_loop(chosen_points), want_geometry=True
+                    )
+                except OsrmError as exc:
+                    last_error = exc
+                    rotation_deg = (
+                        rotation_deg + random.uniform(15.0, 40.0)
+                    ) % 360.0
+                    continue
+
+                coords = final_result["coordinates"] or []
+                total_m = final_result["total_distance"]
                 double_backs = count_double_back_segments(coords)
 
                 if (

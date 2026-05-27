@@ -45,8 +45,13 @@
   // ---------------------------------------------------------------------------
 
   var slider          = document.getElementById("distance-slider");
+  var distanceInput   = document.getElementById("distance-input");
   var distanceReadout = document.getElementById("distance-value");
   var generateBtn     = document.getElementById("generate-btn");
+
+  // Slider bounds are the source of truth for what the backend accepts.
+  var DISTANCE_MIN_KM = parseFloat(slider.min);
+  var DISTANCE_MAX_KM = parseFloat(slider.max);
   var routeStatsEl    = document.getElementById("route-stats");
   var statDistance    = document.getElementById("stat-distance");
   var statGain        = document.getElementById("stat-elevation-gain");
@@ -147,8 +152,29 @@
     return Math.round(m) + " m";
   }
 
+  // Parse the input box. Returns the numeric distance in km, or null if the
+  // text isn't a usable positive number inside the allowed range. Treat
+  // whitespace-only strings the same as empty.
+  function parseDistanceInput() {
+    var raw = (distanceInput.value || "").trim();
+    if (raw === "") { return null; }
+    var n = Number(raw);
+    if (!isFinite(n) || n <= 0) { return null; }
+    if (n < DISTANCE_MIN_KM || n > DISTANCE_MAX_KM) { return null; }
+    return n;
+  }
+
+  // Refresh the readable "X km" label and the red-border invalid state.
+  // Always uses the input box (the user-typed value) as the source of truth.
   function syncDistanceLabel() {
-    distanceReadout.textContent = formatKm(slider.value);
+    var parsed = parseDistanceInput();
+    if (parsed === null) {
+      distanceReadout.textContent = "— km";
+      distanceInput.classList.add("invalid");
+    } else {
+      distanceReadout.textContent = formatKm(parsed);
+      distanceInput.classList.remove("invalid");
+    }
   }
 
   function setStatus(text, isError) {
@@ -433,9 +459,16 @@
       return;
     }
 
-    var targetKm = parseFloat(slider.value);
-    if (isNaN(targetKm) || targetKm <= 0) {
-      setStatus("Pick a positive distance on the slider.", true);
+    // Distance always comes from the typed input box — it stays in sync with
+    // the slider, but the box is the only field that can hold invalid text.
+    var targetKm = parseDistanceInput();
+    if (targetKm === null) {
+      distanceInput.classList.add("invalid");
+      setStatus(
+        "Invalid distance. Enter a number between " +
+          DISTANCE_MIN_KM + " and " + DISTANCE_MAX_KM + " km.",
+        true
+      );
       return;
     }
 
@@ -491,12 +524,33 @@
     setStatus("Start point set. Adjust distance, then generate.");
   });
 
-  slider.addEventListener("input", syncDistanceLabel);
+  // Slider → input: any slider movement overwrites the typed value with the
+  // slider's well-formed number, which also clears any "invalid" styling.
+  slider.addEventListener("input", function () {
+    distanceInput.value = slider.value;
+    syncDistanceLabel();
+  });
+
+  // Input → slider: mirror the typed value back onto the slider knob, but
+  // only when the value is valid. While the user is mid-typing ("1." or "")
+  // we leave the slider where it was and just refresh the label/invalid mark.
+  distanceInput.addEventListener("input", function () {
+    var parsed = parseDistanceInput();
+    if (parsed !== null) {
+      slider.value = String(parsed);
+    }
+    syncDistanceLabel();
+  });
+
   syncDistanceLabel();
 
   generateBtn.addEventListener("click", generateRoute);
 
   slider.addEventListener("keydown", function (ev) {
+    if (ev.key === "Enter") { ev.preventDefault(); generateRoute(); }
+  });
+
+  distanceInput.addEventListener("keydown", function (ev) {
     if (ev.key === "Enter") { ev.preventDefault(); generateRoute(); }
   });
 
