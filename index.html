@@ -11,7 +11,7 @@
 
     <link rel="preconnect" href="https://unpkg.com" crossorigin="" />
     <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin="" />
-    <link rel="preconnect" href="https://tiles.stadiamaps.com" crossorigin="" />
+    <link rel="preconnect" href="https://tile.openstreetmap.org" crossorigin="" />
 
     <!--
       Leaflet CSS (styles for map tiles, controls, popups).
@@ -99,6 +99,20 @@
         <div id="map" aria-label="Interactive map"></div>
       </section>
     </main>
+
+    <!--
+      Backend URL configuration.
+
+      Local development (python run.py): leave this commented out. app.js will
+      default to http://<this-hostname>:8000.
+
+      Production: uncomment the line below and replace the URL with the origin
+      of your deployed FastAPI backend (Render, Fly.io, Railway, etc.). Make
+      sure that backend's CORS_ORIGINS env var lists this frontend's origin.
+    -->
+    <script>
+      // window.ROUTERUNNER_API_BASE_URL = "https://your-backend.onrender.com";
+    </script>
 
     <!--
       Leaflet JavaScript: must load before app.js because app.js will use the global `L` object.

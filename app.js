@@ -11,13 +11,19 @@
 (function () {
   "use strict";
 
-  // Points to the local FastAPI backend. Uses the same hostname as the page
-  // so the browser treats it as a same-host cross-port request (valid CORS).
-  var API_GENERATE_ROUTE =
-    window.location.protocol +
-    "//" +
-    window.location.hostname +
-    ":8000/generate-route";
+  // Resolve the backend URL.
+  //
+  // Production: set window.ROUTERUNNER_API_BASE_URL in index.html to the full
+  // origin of your deployed FastAPI host (e.g. "https://routerunner-api.onrender.com").
+  // The backend's CORS_ORIGINS env var must list this site's origin in return.
+  //
+  // Local dev: when the override isn't set we point at the same hostname the
+  // page is served from on port 8000, which matches `python run.py` and any
+  // other local-dev setup that uses the default backend port.
+  var API_BASE_URL =
+    (typeof window !== "undefined" && window.ROUTERUNNER_API_BASE_URL) ||
+    window.location.protocol + "//" + window.location.hostname + ":8000";
+  var API_GENERATE_ROUTE = API_BASE_URL.replace(/\/$/, "") + "/generate-route";
 
   // Visual constants
   var DIRECTION_ARROW_MIN_TURN_DEG = 20;
@@ -35,9 +41,13 @@
 
   var map = L.map("map").setView([DEFAULT_CENTER.lat, DEFAULT_CENTER.lng], DEFAULT_ZOOM);
 
-  L.tileLayer("https://tiles.stadiamaps.com/tiles/outdoors/{z}/{x}/{y}{r}.png", {
-    maxZoom: 20,
-    attribution: "© Stadia Maps, © OpenStreetMap",
+  // OpenStreetMap standard tiles — no API key and no domain whitelist, so
+  // they work the same on localhost and on every deployed host. If you want
+  // nicer cartography later you can swap in Stadia / CARTO / Mapbox here.
+  L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    maxZoom: 19,
+    attribution:
+      '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
   }).addTo(map);
 
   // ---------------------------------------------------------------------------
