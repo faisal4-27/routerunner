@@ -45,49 +45,6 @@ def approx_distance_meters(a: Sequence[float], b: Sequence[float]) -> float:
     return math.hypot(d_lat, d_lng)
 
 
-def last_coord_lat_lng(coords: Sequence[LngLat]) -> Tuple[float, float]:
-    """Return (lat, lng) of the last vertex in a coordinate list."""
-    lng, lat = coords[-1]
-    return lat, lng
-
-
-def segment_bearing_deg(from_pt: Sequence[float], to_pt: Sequence[float]) -> float:
-    """Compass bearing (0–360°) from one point to the next."""
-    from_lng, from_lat = from_pt[0], from_pt[1]
-    to_lng, to_lat = to_pt[0], to_pt[1]
-    lat_rad = math.radians((from_lat + to_lat) / 2)
-    dx = (to_lng - from_lng) * math.cos(lat_rad)
-    dy = to_lat - from_lat
-    bearing = math.degrees(math.atan2(dx, dy))
-    return bearing % 360 if bearing >= 0 else bearing + 360
-
-
-def route_end_bearing_deg(coords: Sequence[LngLat]) -> float:
-    """Bearing of the final segment — used to compute the next 90° right turn."""
-    if len(coords) < 2:
-        return 0.0
-    return segment_bearing_deg(coords[-2], coords[-1])
-
-
-def append_line_string_coords(base: List[LngLat], extension: Sequence[LngLat]) -> List[LngLat]:
-    """
-    Concatenate two LineStrings, skipping a duplicate join vertex when endpoints
-    are within ~6 m of each other.
-    """
-    if not extension:
-        return list(base)
-    if not base:
-        return list(extension)
-
-    out = list(base)
-    first_ext = extension[0]
-    last_base = out[-1]
-    start_idx = 1 if approx_distance_meters(last_base, first_ext) < 6 else 0
-    for i in range(start_idx, len(extension)):
-        out.append(list(extension[i]))
-    return out
-
-
 def sample_line_coords(coords: Sequence[LngLat], max_points: int) -> List[LngLat]:
     """
     Keep every Nth vertex so API requests stay small.

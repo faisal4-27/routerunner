@@ -11,9 +11,10 @@ A web app that generates running routes based on a selected location and distanc
 ## Tech Stack
 - HTML / CSS / JavaScript
 - Leaflet.js
-- OSRM API
-- Overpass API
-- OpenTopoData
+- OSRM (routing)
+- Overpass API (traffic signal lookup)
+- Open-Meteo (elevation)
+- FastAPI + httpx (Python backend)
 
 ## Getting Started
 
@@ -24,6 +25,16 @@ From the project root, install backend dependencies once:
 ```bash
 pip install -r backend/requirements.txt
 ```
+
+Copy the example env file so the backend can read it:
+
+```bash
+cp backend/.env.example backend/.env
+```
+
+The defaults point at public OSRM / Overpass / Open-Meteo endpoints and work
+out of the box. Edit `backend/.env` to swap in your own endpoints or set the
+allowed CORS origins for your deployed frontend.
 
 Then start everything:
 
@@ -49,7 +60,8 @@ python -m http.server 3001 --bind 127.0.0.1
 ```
 
 ## Roadmap
-- [ ] React frontend
 - [x] Python backend
 - [x] Traffic signal minimization
+- [x] Elevation gain + biggest climb
+- [ ] React frontend
 - [ ] Elevation chart
