@@ -15,6 +15,12 @@ Press Ctrl+C in the terminal running `python run.py` to stop both servers.
 from __future__ import annotations
 
 import os
+
+# Disable Python bytecode caching for this process AND any subprocesses we
+# spawn (uvicorn, the static server). Setting it before importing anything
+# project-related guarantees no `__pycache__` folders are ever written.
+os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+
 import signal
 import socket
 import subprocess
@@ -26,7 +32,9 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 BACKEND_DIR = os.path.join(ROOT, "backend")
 
 FRONTEND_PORT = 3001
-BACKEND_PORT = 8000
+# Backend port is configurable so deployment platforms (Render, Fly, etc.)
+# can inject their own PORT env var without touching this file.
+BACKEND_PORT = int(os.environ.get("PORT", "8000"))
 
 # Child processes we start below — used to shut everything down on Ctrl+C.
 children: list[subprocess.Popen] = []

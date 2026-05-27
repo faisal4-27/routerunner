@@ -89,9 +89,22 @@
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // Location privacy notes (read once, never stored, never transmitted)
+  // ---------------------------------------------------------------------------
+  // - We call navigator.geolocation.getCurrentPosition() exactly once, on
+  //   page load, to centre the map on the user. We never re-request it
+  //   silently in the background.
+  // - The coordinates are kept in browser memory only. They are NEVER
+  //   persisted (no localStorage, no cookies) and NEVER sent to our server
+  //   — the only thing the backend ever receives is the start point the
+  //   user explicitly picks for a route.
+  // - enableHighAccuracy is false on purpose: rough city-block accuracy is
+  //   plenty for centring the map and avoids the aggressive permission
+  //   prompts (and battery drain) that high-accuracy GPS triggers on mobile.
   function initializeUserLocation() {
     if (!navigator.geolocation) {
-      setStatus("Geolocation unavailable. Map starts at the University of Waterloo.");
+      setStatus("Showing default map location — click anywhere to set your start point.");
       return;
     }
 
@@ -102,9 +115,16 @@
         setStatus("Start point set to your location. Click anywhere to move it.");
       },
       function () {
-        setStatus("Could not access location. Map starts at the University of Waterloo.");
+        // Permission denied or timed out — fall back gracefully without
+        // alarming the user about it.
+        setStatus("Showing default map location — click anywhere to set your start point.");
       },
-      { enableHighAccuracy: false, timeout: 4000, maximumAge: 300000 }
+      // timeout is generous (20s) because the geolocation timer starts
+      // immediately and includes the time the user spends on the
+      // permission prompt — too-short timeouts fire the error callback
+      // before the user can click "Allow", which is the most common
+      // reason "Allow location" appears to do nothing.
+      { enableHighAccuracy: false, timeout: 20000, maximumAge: 300000 }
     );
   }
 
@@ -425,6 +445,10 @@
     fetch(API_GENERATE_ROUTE, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      // Never cache route responses — every Generate click must hit the
+      // backend and get a fresh result, even if the body is byte-identical
+      // to a previous request.
+      cache: "no-store",
       body: JSON.stringify({
         lat: startPoint.lat,
         lng: startPoint.lng,
