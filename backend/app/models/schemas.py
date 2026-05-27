@@ -26,10 +26,15 @@ class RouteCandidate(BaseModel):
     A single loop route returned to the client.
 
     `coordinates` is a GeoJSON LineString: list of [longitude, latitude] pairs.
+
+    `max_climb_m` is the largest contiguous low-to-high elevation change
+    anywhere along the loop — i.e. the toughest single climb the runner
+    will face. It replaces an "elevation loss" field that, for any closed
+    loop, mathematically had to equal the gain.
     """
 
     coordinates: List[List[float]]
     distance_meters: float
     elevation_gain_m: float
-    elevation_loss_m: float
+    max_climb_m: float
     signal_count: int

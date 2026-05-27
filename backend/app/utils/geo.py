@@ -106,6 +106,61 @@ def sample_line_coords(coords: Sequence[LngLat], max_points: int) -> List[LngLat
     return out
 
 
+def count_short_uturns(
+    coords: Sequence[LngLat],
+    max_street_m: float = 100.0,
+    return_radius_m: float = 12.0,
+) -> int:
+    """
+    Count up-and-back U-turns on streets shorter than `max_street_m`.
+
+    These are the worst kind of double-back from a runner's point of view:
+    the route goes a short distance up a street (often a cul-de-sac OSRM
+    used to pad the distance) and immediately comes back the same way.
+
+    For every vertex i we walk forward along the polyline until the
+    accumulated path length passes `2 × max_street_m`. If, before that
+    happens, we land within `return_radius_m` of the starting vertex, we
+    count one U-turn and skip past it so a single zig-zag isn't double-
+    counted.
+
+    Designed to be cheap: the inner walk is bounded by path length, not
+    polyline length, so it's effectively O(n) on real route data.
+    """
+    n = len(coords)
+    if n < 3:
+        return 0
+
+    walk_budget_m = 2.0 * max_street_m
+    count = 0
+    i = 0
+
+    while i < n - 2:
+        path_len = 0.0
+        hit_index = -1
+
+        for j in range(i + 1, n):
+            path_len += approx_distance_meters(coords[j - 1], coords[j])
+            if path_len > walk_budget_m:
+                break
+            # Need at least one real step out before "returning" counts —
+            # otherwise tiny zig-zags within OSRM's geometry trigger false
+            # positives.
+            if path_len < return_radius_m * 2:
+                continue
+            if approx_distance_meters(coords[i], coords[j]) < return_radius_m:
+                hit_index = j
+                break
+
+        if hit_index == -1:
+            i += 1
+        else:
+            count += 1
+            i = hit_index + 1
+
+    return count
+
+
 def count_double_back_segments(
     coords: Sequence[LngLat], min_segment_m: float = 25.0
 ) -> int:

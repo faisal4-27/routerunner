@@ -24,7 +24,10 @@ OVERPASS_USER_AGENT = os.getenv(
 )
 
 SIGNAL_SEARCH_RADIUS_M = 35
-MAX_SAMPLE_POINTS = 45
+# Each sample point becomes an `around:` clause in the Overpass QL query;
+# 25 points covers a typical loop while keeping the query short enough
+# that Overpass responds in well under a second on a normal day.
+MAX_SAMPLE_POINTS = 25
 
 # Only one Overpass call at a time per server process (fair use policy).
 _overpass_lock = asyncio.Lock()

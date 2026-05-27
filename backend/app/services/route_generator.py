@@ -34,15 +34,22 @@ from app.services.overpass import count_traffic_signals
 from app.utils.geo import (
     LngLat,
     count_double_back_segments,
+    count_short_uturns,
     offset_lat_lng,
 )
+
+# A "short" street for U-turn purposes — the user explicitly does not want
+# any out-and-back on a street shorter than this.
+SHORT_STREET_M = 100.0
 
 # 5 evenly-spaced points around the circle (start + 4 others, 72° apart).
 NUM_POINTS = 5
 ANGLE_STEP_DEG = 360.0 / NUM_POINTS
 
 # How many times to nudge waypoints in/out chasing the target distance.
-DISTANCE_ITERATIONS = 6
+# In practice routes converge within 2–3 tries; 4 is plenty of headroom and
+# noticeably faster than the 6-iteration default when convergence drags.
+DISTANCE_ITERATIONS = 4
 
 # How many times to rotate the whole circle when fighting double-backs.
 ROTATION_ATTEMPTS = 4
@@ -143,7 +150,7 @@ async def _enrich(
     distance_meters: float,
 ) -> RouteCandidate:
     """
-    Attach signal count and elevation gain/loss to a finished route.
+    Attach signal count and elevation stats to a finished route.
 
     Overpass (signals) and Open-Meteo (elevation) are independent third-party
     calls, so we fire them in parallel. A flaky Overpass response just yields
@@ -156,7 +163,7 @@ async def _enrich(
         except Exception:
             return 0
 
-    signal_count, (gain, loss) = await asyncio.gather(
+    signal_count, (gain_m, max_climb_m) = await asyncio.gather(
         _signals(),
         fetch_elevations_along_route(client, coords),
     )
@@ -164,8 +171,8 @@ async def _enrich(
     return RouteCandidate(
         coordinates=coords,
         distance_meters=distance_meters,
-        elevation_gain_m=round(gain),
-        elevation_loss_m=round(loss),
+        elevation_gain_m=round(gain_m),
+        max_climb_m=round(max_climb_m),
         signal_count=signal_count,
     )
 
@@ -185,7 +192,11 @@ async def generate_route(
     base_radius_m = target_m / (2.0 * math.pi)
     tolerance_m = max(150.0, target_m * DISTANCE_TOLERANCE_FRAC)
 
-    best: Tuple[List[LngLat], float, int] | None = None
+    # Quality score is (short_uturns, double_backs) — strictly less is
+    # better, so any route with a short U-turn loses to one without.
+    best_coords: List[LngLat] | None = None
+    best_total_m = 0.0
+    best_score: Tuple[int, int] = (10**9, 10**9)
     last_error: Exception | None = None
     # Random initial rotation so repeated clicks on the same start point
     # don't keep producing the identical loop (and identical elevation /
@@ -239,23 +250,28 @@ async def generate_route(
 
                 coords = final_result["coordinates"] or []
                 total_m = final_result["total_distance"]
+                short_uturns = count_short_uturns(coords, SHORT_STREET_M)
                 double_backs = count_double_back_segments(coords)
+                score = (short_uturns, double_backs)
 
+                # Perfect run: in distance, no short U-turn, no double-back.
                 if (
                     abs(target_m - total_m) <= tolerance_m
+                    and short_uturns == 0
                     and double_backs == 0
                 ):
                     return await _enrich(client, coords, total_m)
 
-                if best is None or double_backs < best[2]:
-                    best = (coords, total_m, double_backs)
+                if score < best_score:
+                    best_coords = coords
+                    best_total_m = total_m
+                    best_score = score
 
             # Rotate the whole circle by a chunky random offset and try again.
             rotation_deg = (rotation_deg + random.uniform(15.0, 40.0)) % 360.0
 
-        if best is not None:
-            coords, total_m, _ = best
-            return await _enrich(client, coords, total_m)
+        if best_coords is not None:
+            return await _enrich(client, best_coords, best_total_m)
 
     raise last_error or OsrmError(
         "Could not generate a route close enough to the target distance. "

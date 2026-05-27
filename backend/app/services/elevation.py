@@ -19,20 +19,40 @@ OPEN_METEO_ELEVATION_URL = os.getenv(
     "OPEN_METEO_ELEVATION_URL", "https://api.open-meteo.com/v1/elevation"
 )
 MAX_POINTS_PER_REQUEST = 100
-ELEVATION_MAX_SAMPLES = 180
+# 96 samples fits in one Open-Meteo batch, keeping the elevation step to
+# one HTTP round-trip even before parallel batching kicks in. For a 5 km
+# loop that's a sample every ~50 m, which is well below Open-Meteo's
+# underlying DEM resolution anyway.
+ELEVATION_MAX_SAMPLES = 96
 
 
-def elevation_gain_loss(elevations: Sequence[float]) -> Tuple[float, float]:
-    """Sum uphill and downhill meters between consecutive samples."""
+def elevation_stats(elevations: Sequence[float]) -> Tuple[float, float]:
+    """
+    Return (total_gain_m, max_climb_m) for a series of elevation samples.
+
+    `total_gain_m` is the sum of every uphill step — exactly the figure a
+    runner sees on a GPS watch as "elevation gain".
+
+    `max_climb_m` is the largest sustained low-to-high difference anywhere
+    on the route, found with Kadane's running-minimum trick. It tells you
+    how big the worst single climb on the loop is — a more useful stat than
+    elevation loss, which for a closed loop is just gain repeated.
+    """
     gain = 0.0
-    loss = 0.0
+    max_climb = 0.0
+    min_so_far = elevations[0] if elevations else 0.0
+
     for i in range(1, len(elevations)):
-        delta = elevations[i] - elevations[i - 1]
-        if delta > 0:
-            gain += delta
-        else:
-            loss += -delta
-    return gain, loss
+        prev = elevations[i - 1]
+        curr = elevations[i]
+        if curr > prev:
+            gain += curr - prev
+        if curr < min_so_far:
+            min_so_far = curr
+        elif curr - min_so_far > max_climb:
+            max_climb = curr - min_so_far
+
+    return gain, max_climb
 
 
 async def fetch_elevations_batch(
@@ -66,11 +86,11 @@ async def fetch_elevations_along_route(
     client: httpx.AsyncClient, coords: Sequence[LngLat]
 ) -> Tuple[float, float]:
     """
-    Sample the route, fetch elevation in batches of 100, return (gain_m, loss_m).
+    Sample the route and return (total_gain_m, max_climb_m).
 
-    Batches are fired concurrently because Open-Meteo handles independent
-    requests in parallel — for a typical loop this turns 2 sequential API
-    calls into 1 round-trip's worth of wall time.
+    Batches are fired concurrently — Open-Meteo handles independent requests
+    in parallel, and with the 96-sample cap a typical loop now needs only
+    one batch (single round-trip).
 
     Returns (0, 0) if the API returns too few usable points.
     """
@@ -90,4 +110,4 @@ async def fetch_elevations_along_route(
 
     if len(all_elev) < 2:
         return 0.0, 0.0
-    return elevation_gain_loss(all_elev)
+    return elevation_stats(all_elev)

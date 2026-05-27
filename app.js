@@ -55,7 +55,7 @@
   var routeStatsEl    = document.getElementById("route-stats");
   var statDistance    = document.getElementById("stat-distance");
   var statGain        = document.getElementById("stat-elevation-gain");
-  var statLoss        = document.getElementById("stat-elevation-loss");
+  var statMaxClimb    = document.getElementById("stat-max-climb");
   var statSignals     = document.getElementById("stat-signals");
   var statusMsg       = document.getElementById("status-msg");
 
@@ -233,76 +233,56 @@
     routeLayer = routeDirectionLayer = routeOverlapLayer = routeHighlightLayer = null;
   }
 
-  /** Build the first `distanceMeters` of the route as a coord list. */
-  function buildPrefixCoords(coordsLngLat, distanceMeters) {
-    var out = [coordsLngLat[0]];
-    var rem = Math.max(0, distanceMeters);
-    for (var i = 0; i < coordsLngLat.length - 1 && rem > 0; i++) {
-      var seg = approxDistanceMeters(coordsLngLat[i], coordsLngLat[i + 1]);
-      if (seg <= rem) { out.push(coordsLngLat[i + 1]); rem -= seg; }
-      else { out.push(interpolateLngLat(coordsLngLat[i], coordsLngLat[i + 1], rem / seg)); rem = 0; }
-    }
-    return out;
-  }
-
-  /** Build the last `distanceMeters` of the route as a coord list. */
-  function buildSuffixCoords(coordsLngLat, distanceMeters) {
-    var rev = [coordsLngLat[coordsLngLat.length - 1]];
-    var rem = Math.max(0, distanceMeters);
-    for (var i = coordsLngLat.length - 1; i > 0 && rem > 0; i--) {
-      var seg = approxDistanceMeters(coordsLngLat[i], coordsLngLat[i - 1]);
-      if (seg <= rem) { rev.push(coordsLngLat[i - 1]); rem -= seg; }
-      else { rev.push(interpolateLngLat(coordsLngLat[i], coordsLngLat[i - 1], rem / seg)); rem = 0; }
-    }
-    return rev.reverse();
-  }
-
-  /** Green start flag + checkered finish flag + coloured end-cap highlights. */
+  /**
+   * Drop a labelled START flag at coords[0] and a labelled FINISH flag at
+   * coords[-1]. No road strips — the bold uppercase labels are the only
+   * decoration the user asked for, and they're plenty on their own.
+   *
+   * Every route this app produces is a closed loop, so the FINISH coord
+   * normally snaps to the same place as START. We nudge the finish marker
+   * ~25 m east so the two labels never sit on top of each other.
+   */
   function drawStartEndHighlights(coordsLngLat) {
     if (!Array.isArray(coordsLngLat) || coordsLngLat.length < 2) { return; }
     routeHighlightLayer = L.layerGroup().addTo(map);
 
     var start = coordsLngLat[0];
     var end   = coordsLngLat[coordsLngLat.length - 1];
-    // Nudge the finish marker slightly if it sits exactly on the start.
-    var endForMarker = approxDistanceMeters(start, end) < 3
-      ? [end[0] + 0.00012, end[1]]
+
+    var FINISH_NUDGE_LNG_DEG = 0.00028;
+    var endForMarker = approxDistanceMeters(start, end) < 8
+      ? [end[0] + FINISH_NUDGE_LNG_DEG, end[1]]
       : end;
 
+    var startFlagHtml =
+      '<div class="route-flag route-flag-start">' +
+        '<div class="route-flag-label route-flag-label-start">START</div>' +
+      '</div>';
+
     L.marker([start[1], start[0]], {
-      interactive: false, keyboard: false,
+      interactive: false, keyboard: false, zIndexOffset: 1000,
       icon: L.divIcon({
         className: "start-flag-icon",
-        html: '<div style="display:flex;align-items:flex-end;gap:2px;">' +
-              '<div style="width:2px;height:18px;background:#2e2e2e;"></div>' +
-              '<div style="width:0;height:0;border-top:6px solid transparent;' +
-              'border-bottom:6px solid transparent;border-left:12px solid #1b8f2e;"></div>' +
-              '</div>',
-        iconSize: [16, 20], iconAnchor: [2, 18],
+        html: startFlagHtml,
+        iconSize:   [110, 36],
+        iconAnchor: [0, 18],
       }),
     }).addTo(routeHighlightLayer);
+
+    var finishFlagHtml =
+      '<div class="route-flag route-flag-finish">' +
+        '<div class="route-flag-label route-flag-label-finish">FINISH</div>' +
+      '</div>';
 
     L.marker([endForMarker[1], endForMarker[0]], {
-      interactive: false, keyboard: false,
+      interactive: false, keyboard: false, zIndexOffset: 1000,
       icon: L.divIcon({
         className: "finish-flag-icon",
-        html: '<div style="font-size:18px;line-height:18px;">🏁</div>',
-        iconSize: [18, 18], iconAnchor: [9, 16],
+        html: finishFlagHtml,
+        iconSize:   [110, 36],
+        iconAnchor: [55, 18],
       }),
     }).addTo(routeHighlightLayer);
-
-    var first = buildPrefixCoords(coordsLngLat, ROUTE_HIGHLIGHT_METERS);
-    if (first.length >= 2) {
-      L.polyline(toLeafletLine(first), { color: "#2e7d32", weight: 7, opacity: 0.95, interactive: false })
-        .addTo(routeHighlightLayer);
-    }
-
-    var last = buildSuffixCoords(coordsLngLat, ROUTE_HIGHLIGHT_METERS);
-    if (last.length >= 2) {
-      var ll = toLeafletLine(last);
-      L.polyline(ll, { color: "#111111", weight: 7, opacity: 0.95, dashArray: "12 12", dashOffset: "0",  interactive: false }).addTo(routeHighlightLayer);
-      L.polyline(ll, { color: "#ffffff", weight: 7, opacity: 0.95, dashArray: "12 12", dashOffset: "12", interactive: false }).addTo(routeHighlightLayer);
-    }
   }
 
   /** Offset a [lng, lat] point perpendicular to a direction vector by `meters`. */
@@ -352,22 +332,46 @@
     }
   }
 
-  /** Draw small directional chevrons along straight sections of the route. */
+  /**
+   * Draw small directional chevrons along straight sections of the route.
+   *
+   * Two-pass design so opposing arrows never both render:
+   *   - Pass 1: build a candidate arrow (position + bearing) for every
+   *     "run" of consecutive same-bearing segments.
+   *   - Pass 2: drop any candidate that sits inside the first/last 100 m of
+   *     path (covered by START / FINISH flags + colour strips), and drop
+   *     any pair of candidates that are spatially close *and* point in
+   *     roughly opposite directions — that's the up-and-back pattern the
+   *     user keeps seeing.
+   *
+   * This works even when OSRM returns slightly different polyline vertices
+   * for the up vs. down traversal of the same street, because we compare
+   * arrow placements, not raw segment coordinates.
+   */
+  var ARROW_PAIR_PROXIMITY_M = 75;   // arrows closer than this on the map…
+  var ARROW_PAIR_OPPOSITE_TOL_DEG = 35;  // …and within this many degrees of being exact opposites = a pair
+
   function drawDirectionArrows(coordsLngLat) {
     if (!Array.isArray(coordsLngLat) || coordsLngLat.length < 2) { return; }
 
+    // Build segment list with cumulative path distance.
     var segments = [];
+    var cumDist = 0;
     for (var i = 0; i < coordsLngLat.length - 1; i++) {
       var len = approxDistanceMeters(coordsLngLat[i], coordsLngLat[i + 1]);
       if (len > 0) {
         segments.push({
-          from: coordsLngLat[i], to: coordsLngLat[i + 1],
-          length: len,
-          bearing: segmentBearingDeg(coordsLngLat[i], coordsLngLat[i + 1]),
+          from:          coordsLngLat[i],
+          to:            coordsLngLat[i + 1],
+          length:        len,
+          bearing:       segmentBearingDeg(coordsLngLat[i], coordsLngLat[i + 1]),
+          distFromStart: cumDist,
         });
+        cumDist += len;
       }
     }
     if (!segments.length) { return; }
+    var totalPathM = cumDist;
 
     // Group consecutive segments with similar bearing into "runs".
     var runs = [];
@@ -382,35 +386,75 @@
     }
     runs.push({ start: rs, end: segments.length - 1, length: rl });
 
-    routeDirectionLayer = L.layerGroup().addTo(map);
-
+    // ---- Pass 1: compute candidate arrows ------------------------------
+    var candidates = [];
     runs.forEach(function (run) {
       if (run.length < DIRECTION_ARROW_MIN_SEGMENT_M) { return; }
 
-      // Find the midpoint of the run to place the arrow.
-      var target = run.length / 2, acc = 0, arrowPt = null, arrowBearing = 0;
+      var target = run.length / 2;
+      var acc = 0;
+      var arrowPt = null;
+      var arrowBearing = 0;
+      var arrowDistFromStart = 0;
       for (var s = run.start; s <= run.end; s++) {
         var seg = segments[s];
         if (acc + seg.length >= target) {
           var t = (target - acc) / seg.length;
-          arrowPt = interpolateLngLat(seg.from, seg.to, t);
-          arrowBearing = seg.bearing;
+          arrowPt            = interpolateLngLat(seg.from, seg.to, t);
+          arrowBearing       = seg.bearing;
+          arrowDistFromStart = seg.distFromStart + seg.length * t;
           break;
         }
         acc += seg.length;
       }
       if (!arrowPt) {
-        var last = segments[run.end];
-        arrowPt = midpointLngLat(last.from, last.to);
-        arrowBearing = last.bearing;
+        var lastSeg = segments[run.end];
+        arrowPt            = midpointLngLat(lastSeg.from, lastSeg.to);
+        arrowBearing       = lastSeg.bearing;
+        arrowDistFromStart = lastSeg.distFromStart + lastSeg.length / 2;
       }
 
-      L.marker([arrowPt[1], arrowPt[0]], {
+      candidates.push({
+        pt:            arrowPt,
+        bearing:       arrowBearing,
+        distFromStart: arrowDistFromStart,
+        suppress:      false,
+      });
+    });
+
+    // ---- Pass 2a: suppress candidates inside the start/finish zone -----
+    candidates.forEach(function (c) {
+      if (c.distFromStart < ROUTE_HIGHLIGHT_METERS) { c.suppress = true; }
+      if (totalPathM - c.distFromStart < ROUTE_HIGHLIGHT_METERS) { c.suppress = true; }
+    });
+
+    // ---- Pass 2b: suppress every pair of candidates that face each other
+    // The up-and-back pattern always produces two candidate arrows close
+    // together with bearings ~180° apart. Removing *both* leaves the user
+    // with a clean stretch of route (and the blue offset stripe already
+    // drawn by drawOppositeDirectionOffsets to indicate the shared street).
+    var opposingPairThresholdDeg = 180 - ARROW_PAIR_OPPOSITE_TOL_DEG;
+    for (var ci = 0; ci < candidates.length; ci++) {
+      if (candidates[ci].suppress) { continue; }
+      for (var cj = ci + 1; cj < candidates.length; cj++) {
+        if (candidates[cj].suppress) { continue; }
+        if (approxDistanceMeters(candidates[ci].pt, candidates[cj].pt) > ARROW_PAIR_PROXIMITY_M) { continue; }
+        if (bearingDeltaDeg(candidates[ci].bearing, candidates[cj].bearing) < opposingPairThresholdDeg) { continue; }
+        candidates[ci].suppress = true;
+        candidates[cj].suppress = true;
+      }
+    }
+
+    // ---- Render whatever survived --------------------------------------
+    routeDirectionLayer = L.layerGroup().addTo(map);
+    candidates.forEach(function (c) {
+      if (c.suppress) { return; }
+      L.marker([c.pt[1], c.pt[0]], {
         interactive: false, keyboard: false,
         icon: L.divIcon({
           className: "direction-arrow-icon",
           html: '<svg width="18" height="18" viewBox="0 0 18 18" ' +
-                'style="transform:rotate(' + (arrowBearing - 90) + 'deg);' +
+                'style="transform:rotate(' + (c.bearing - 90) + 'deg);' +
                 'transform-origin:center center;opacity:0.95;">' +
                 '<path d="M3 4 L11 9 L3 14" stroke="#111111" stroke-width="3" fill="none" ' +
                 'stroke-linecap="round" stroke-linejoin="round"></path></svg>',
@@ -444,7 +488,7 @@
   function showRouteStats(route) {
     statDistance.textContent = formatDistanceM(route.distance_meters);
     statGain.textContent     = formatElevationM(route.elevation_gain_m);
-    statLoss.textContent     = formatElevationM(route.elevation_loss_m);
+    statMaxClimb.textContent = formatElevationM(route.max_climb_m);
     statSignals.textContent  = String(route.signal_count);
     routeStatsEl.hidden = false;
   }
