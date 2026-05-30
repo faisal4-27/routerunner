@@ -26,8 +26,7 @@
   var API_GENERATE_ROUTE = API_BASE_URL.replace(/\/$/, "") + "/generate-route";
 
   // Visual constants
-  var DIRECTION_ARROW_MIN_TURN_DEG = 20;
-  var DIRECTION_ARROW_MIN_SEGMENT_M = 25;
+  var OVERLAP_MIN_SEGMENT_M = 25;
   var OVERLAP_OFFSET_METERS = 4;
   var ROUTE_HIGHLIGHT_METERS = 100;
 
@@ -69,6 +68,7 @@
   var statSignals     = document.getElementById("stat-signals");
   var statusMsg       = document.getElementById("status-msg");
   var mapLoading      = document.getElementById("map-loading");
+  var mapLoadingText  = document.getElementById("map-loading-text");
 
   // ---------------------------------------------------------------------------
   // Mutable state
@@ -198,6 +198,157 @@
     mapLoading.hidden = !active;
   }
 
+  function setMapLoadingText(text) {
+    if (mapLoadingText) { mapLoadingText.textContent = text; }
+  }
+
+  // ---------------------------------------------------------------------------
+  // "Show the work" generation animation (client-side, near the dropped pin)
+  //
+  // Speed is the priority, so the actual route comes from the fast parallel
+  // POST /generate-route call. While we wait, we play a lightweight animation
+  // around the start pin — an orbiting search circle, pulsing waypoints, and a
+  // candidate loop — to make the wait feel purposeful. It's illustrative, not a
+  // live trace of the server's computation, and it adds zero generation cost.
+  // The map is frozen while it runs so the view can't drift.
+  // ---------------------------------------------------------------------------
+
+  var genLayer = null;
+  var genRaf = null;
+  var genMsgTimer = null;
+
+  var GEN_MESSAGES = [
+    "Placing waypoints around your start…",
+    "Routing through the waypoints…",
+    "Tuning the loop toward your distance…",
+    "Trying a different orientation…",
+    "Checking for U-turns and double-backs…",
+    "Scoring candidate loops…",
+  ];
+
+  // Destination point `distM` away from (lat,lng) along a compass bearing, on a
+  // spherical Earth. Returns [lat, lng].
+  function destPoint(lat, lng, distM, bearingDeg) {
+    var R = 6371000;
+    var br = (bearingDeg * Math.PI) / 180;
+    var lat1 = (lat * Math.PI) / 180;
+    var lon1 = (lng * Math.PI) / 180;
+    var dr = distM / R;
+    var lat2 = Math.asin(
+      Math.sin(lat1) * Math.cos(dr) +
+        Math.cos(lat1) * Math.sin(dr) * Math.cos(br)
+    );
+    var lon2 =
+      lon1 +
+      Math.atan2(
+        Math.sin(br) * Math.sin(dr) * Math.cos(lat1),
+        Math.cos(dr) - Math.sin(lat1) * Math.sin(lat2)
+      );
+    return [(lat2 * 180) / Math.PI, (lon2 * 180) / Math.PI];
+  }
+
+  // Disable/enable all user interaction so the view stays put during the work.
+  function freezeMap(freeze) {
+    ["dragging", "touchZoom", "doubleClickZoom", "scrollWheelZoom", "boxZoom", "keyboard", "tap"].forEach(
+      function (handler) {
+        if (map[handler]) {
+          if (freeze) { map[handler].disable(); } else { map[handler].enable(); }
+        }
+      }
+    );
+    if (map.zoomControl && map.zoomControl._container) {
+      map.zoomControl._container.style.pointerEvents = freeze ? "none" : "";
+      map.zoomControl._container.style.opacity = freeze ? "0.45" : "";
+    }
+  }
+
+  function startGenerationViz(start, targetKm) {
+    stopGenerationViz();
+
+    // Characteristic loop radius (circumference / 2π) just to size the visuals
+    // sensibly around the pin — not used for the real route.
+    var radiusM = (targetKm * 1000) / (2 * Math.PI);
+
+    // Frame the work near the pin, then freeze so it can't drift while running.
+    try {
+      var bounds = L.latLng(start.lat, start.lng).toBounds(radiusM * 4.2);
+      map.fitBounds(bounds, { padding: [20, 20], maxZoom: 16, animate: false });
+    } catch (e) { /* ignore framing failure */ }
+    freezeMap(true);
+
+    genLayer = L.layerGroup().addTo(map);
+
+    var searchCircle = L.circle([start.lat, start.lng], {
+      radius: radiusM,
+      color: "#fc4c02", weight: 1.5, opacity: 0.5,
+      fillColor: "#fc4c02", fillOpacity: 0.05,
+      dashArray: "5 6", interactive: false,
+    }).addTo(genLayer);
+
+    var candidate = L.polyline([], {
+      color: "#fc4c02", weight: 3, opacity: 0.85,
+      dashArray: "2 8", interactive: false,
+    }).addTo(genLayer);
+
+    // Fixed start marker (the user's chosen point).
+    L.circleMarker([start.lat, start.lng], {
+      radius: 6, color: "#0d47a1", weight: 2,
+      fillColor: "#ffffff", fillOpacity: 1, interactive: false,
+    }).addTo(genLayer);
+
+    var NUM = 5;
+    var STEP = 360 / NUM;
+    var wpMarkers = [];
+    for (var i = 1; i < NUM; i++) {
+      wpMarkers.push(
+        L.circleMarker([start.lat, start.lng], {
+          radius: 5, color: "#fc4c02", weight: 2,
+          fillColor: "#ffd9c7", fillOpacity: 1, interactive: false,
+        }).addTo(genLayer)
+      );
+    }
+
+    var startTs = null;
+    function frame(ts) {
+      if (startTs === null) { startTs = ts; }
+      var t = (ts - startTs) / 1000;
+      var rotation = (t * 70) % 360; // orbit the circle ~70°/sec
+
+      var center = destPoint(start.lat, start.lng, radiusM, rotation);
+      searchCircle.setLatLng(center);
+
+      var startAngle = (rotation + 180) % 360;
+      var pts = [[start.lat, start.lng]];
+      for (var k = 1; k < NUM; k++) {
+        // Gently pulse each waypoint's radius so it reads as "tuning".
+        var pulse = 1 + 0.06 * Math.sin(t * 3 + k);
+        var ang = (startAngle + STEP * k) % 360;
+        var p = destPoint(center[0], center[1], radiusM * pulse, ang);
+        pts.push(p);
+        wpMarkers[k - 1].setLatLng(p);
+      }
+      pts.push([start.lat, start.lng]);
+      candidate.setLatLngs(pts);
+
+      genRaf = requestAnimationFrame(frame);
+    }
+    genRaf = requestAnimationFrame(frame);
+
+    var idx = 0;
+    setMapLoadingText(GEN_MESSAGES[0]);
+    genMsgTimer = setInterval(function () {
+      idx = (idx + 1) % GEN_MESSAGES.length;
+      setMapLoadingText(GEN_MESSAGES[idx]);
+    }, 1400);
+  }
+
+  function stopGenerationViz() {
+    if (genRaf) { cancelAnimationFrame(genRaf); genRaf = null; }
+    if (genMsgTimer) { clearInterval(genMsgTimer); genMsgTimer = null; }
+    if (genLayer) { map.removeLayer(genLayer); genLayer = null; }
+    freezeMap(false);
+  }
+
   // ---------------------------------------------------------------------------
   // Geometry helpers (used for drawing arrows and overlap offsets)
   // ---------------------------------------------------------------------------
@@ -212,11 +363,6 @@
     var dx = (toLngLat[0] - fromLngLat[0]) * Math.cos(latRad);
     var dy = toLngLat[1] - fromLngLat[1];
     return normalizeBearingDeg((Math.atan2(dx, dy) * 180) / Math.PI);
-  }
-
-  function bearingDeltaDeg(a, b) {
-    var d = Math.abs(a - b) % 360;
-    return d > 180 ? 360 - d : d;
   }
 
   function approxDistanceMeters(aLngLat, bLngLat) {
@@ -355,7 +501,7 @@
     for (var i = 0; i < coordsLngLat.length - 1; i++) {
       var a = coordsLngLat[i];
       var b = coordsLngLat[i + 1];
-      if (approxDistanceMeters(a, b) < DIRECTION_ARROW_MIN_SEGMENT_M) { continue; }
+      if (approxDistanceMeters(a, b) < OVERLAP_MIN_SEGMENT_M) { continue; }
 
       var ax = a[0].toFixed(6), ay = a[1].toFixed(6);
       var bx = b[0].toFixed(6), by = b[1].toFixed(6);
@@ -383,135 +529,68 @@
   }
 
   /**
-   * Draw small directional chevrons along straight sections of the route.
+   * Draw a small, fixed number of directional chevrons evenly spaced along
+   * the route — just enough to convey the general travel direction.
    *
-   * Two-pass design so opposing arrows never both render:
-   *   - Pass 1: build a candidate arrow (position + bearing) for every
-   *     "run" of consecutive same-bearing segments.
-   *   - Pass 2: drop any candidate that sits inside the first/last 100 m of
-   *     path (covered by START / FINISH flags + colour strips), and drop
-   *     any pair of candidates that are spatially close *and* point in
-   *     roughly opposite directions — that's the up-and-back pattern the
-   *     user keeps seeing.
-   *
-   * This works even when OSRM returns slightly different polyline vertices
-   * for the up vs. down traversal of the same street, because we compare
-   * arrow placements, not raw segment coordinates.
+   * We don't put an arrow at every turn or every leg (that clutters the map
+   * and bunches chevrons around corners). Instead we drop DIRECTION_ARROW_COUNT
+   * arrows at evenly spaced interior points of the total path. The (k + 0.5)/N
+   * offsets keep all of them clear of the START / FINISH flag at the ends, and
+   * each arrow is oriented along the route's heading at that point.
    */
-  var ARROW_PAIR_PROXIMITY_M = 75;   // arrows closer than this on the map…
-  var ARROW_PAIR_OPPOSITE_TOL_DEG = 35;  // …and within this many degrees of being exact opposites = a pair
+  var DIRECTION_ARROW_COUNT = 4;
+
+  function pointAndBearingAtDistance(segments, dist) {
+    var acc = 0;
+    for (var s = 0; s < segments.length; s++) {
+      var seg = segments[s];
+      if (acc + seg.length >= dist) {
+        var t = (dist - acc) / seg.length;
+        return { pt: interpolateLngLat(seg.from, seg.to, t), bearing: seg.bearing };
+      }
+      acc += seg.length;
+    }
+    var last = segments[segments.length - 1];
+    return { pt: midpointLngLat(last.from, last.to), bearing: last.bearing };
+  }
 
   function drawDirectionArrows(coordsLngLat) {
     if (!Array.isArray(coordsLngLat) || coordsLngLat.length < 2) { return; }
 
-    // Build segment list with cumulative path distance.
+    // Build segment list (with heading) and total path length.
     var segments = [];
-    var cumDist = 0;
+    var totalPathM = 0;
     for (var i = 0; i < coordsLngLat.length - 1; i++) {
       var len = approxDistanceMeters(coordsLngLat[i], coordsLngLat[i + 1]);
       if (len > 0) {
         segments.push({
-          from:          coordsLngLat[i],
-          to:            coordsLngLat[i + 1],
-          length:        len,
-          bearing:       segmentBearingDeg(coordsLngLat[i], coordsLngLat[i + 1]),
-          distFromStart: cumDist,
+          from:    coordsLngLat[i],
+          to:      coordsLngLat[i + 1],
+          length:  len,
+          bearing: segmentBearingDeg(coordsLngLat[i], coordsLngLat[i + 1]),
         });
-        cumDist += len;
+        totalPathM += len;
       }
     }
     if (!segments.length) { return; }
-    var totalPathM = cumDist;
 
-    // Group consecutive segments with similar bearing into "runs".
-    var runs = [];
-    var rs = 0, rl = segments[0].length, rb = segments[0].bearing;
-    for (var j = 1; j < segments.length; j++) {
-      if (bearingDeltaDeg(rb, segments[j].bearing) >= DIRECTION_ARROW_MIN_TURN_DEG) {
-        runs.push({ start: rs, end: j - 1, length: rl });
-        rs = j; rl = segments[j].length; rb = segments[j].bearing;
-      } else {
-        rl += segments[j].length; rb = segments[j].bearing;
-      }
-    }
-    runs.push({ start: rs, end: segments.length - 1, length: rl });
-
-    // ---- Pass 1: compute candidate arrows ------------------------------
-    var candidates = [];
-    runs.forEach(function (run) {
-      if (run.length < DIRECTION_ARROW_MIN_SEGMENT_M) { return; }
-
-      var target = run.length / 2;
-      var acc = 0;
-      var arrowPt = null;
-      var arrowBearing = 0;
-      var arrowDistFromStart = 0;
-      for (var s = run.start; s <= run.end; s++) {
-        var seg = segments[s];
-        if (acc + seg.length >= target) {
-          var t = (target - acc) / seg.length;
-          arrowPt            = interpolateLngLat(seg.from, seg.to, t);
-          arrowBearing       = seg.bearing;
-          arrowDistFromStart = seg.distFromStart + seg.length * t;
-          break;
-        }
-        acc += seg.length;
-      }
-      if (!arrowPt) {
-        var lastSeg = segments[run.end];
-        arrowPt            = midpointLngLat(lastSeg.from, lastSeg.to);
-        arrowBearing       = lastSeg.bearing;
-        arrowDistFromStart = lastSeg.distFromStart + lastSeg.length / 2;
-      }
-
-      candidates.push({
-        pt:            arrowPt,
-        bearing:       arrowBearing,
-        distFromStart: arrowDistFromStart,
-        suppress:      false,
-      });
-    });
-
-    // ---- Pass 2a: suppress candidates inside the start/finish zone -----
-    candidates.forEach(function (c) {
-      if (c.distFromStart < ROUTE_HIGHLIGHT_METERS) { c.suppress = true; }
-      if (totalPathM - c.distFromStart < ROUTE_HIGHLIGHT_METERS) { c.suppress = true; }
-    });
-
-    // ---- Pass 2b: suppress every pair of candidates that face each other
-    // The up-and-back pattern always produces two candidate arrows close
-    // together with bearings ~180° apart. Removing *both* leaves the user
-    // with a clean stretch of route (and the blue offset stripe already
-    // drawn by drawOppositeDirectionOffsets to indicate the shared street).
-    var opposingPairThresholdDeg = 180 - ARROW_PAIR_OPPOSITE_TOL_DEG;
-    for (var ci = 0; ci < candidates.length; ci++) {
-      if (candidates[ci].suppress) { continue; }
-      for (var cj = ci + 1; cj < candidates.length; cj++) {
-        if (candidates[cj].suppress) { continue; }
-        if (approxDistanceMeters(candidates[ci].pt, candidates[cj].pt) > ARROW_PAIR_PROXIMITY_M) { continue; }
-        if (bearingDeltaDeg(candidates[ci].bearing, candidates[cj].bearing) < opposingPairThresholdDeg) { continue; }
-        candidates[ci].suppress = true;
-        candidates[cj].suppress = true;
-      }
-    }
-
-    // ---- Render whatever survived --------------------------------------
     routeDirectionLayer = L.layerGroup().addTo(map);
-    candidates.forEach(function (c) {
-      if (c.suppress) { return; }
-      L.marker([c.pt[1], c.pt[0]], {
+    for (var k = 0; k < DIRECTION_ARROW_COUNT; k++) {
+      var frac = (k + 0.5) / DIRECTION_ARROW_COUNT;
+      var p = pointAndBearingAtDistance(segments, totalPathM * frac);
+      L.marker([p.pt[1], p.pt[0]], {
         interactive: false, keyboard: false,
         icon: L.divIcon({
           className: "direction-arrow-icon",
           html: '<svg width="18" height="18" viewBox="0 0 18 18" ' +
-                'style="transform:rotate(' + (c.bearing - 90) + 'deg);' +
+                'style="transform:rotate(' + (p.bearing - 90) + 'deg);' +
                 'transform-origin:center center;opacity:0.95;">' +
                 '<path d="M3 4 L11 9 L3 14" stroke="#111111" stroke-width="3" fill="none" ' +
                 'stroke-linecap="round" stroke-linejoin="round"></path></svg>',
           iconSize: [18, 18], iconAnchor: [9, 9],
         }),
       }).addTo(routeDirectionLayer);
-    });
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -544,7 +623,7 @@
   }
 
   // ---------------------------------------------------------------------------
-  // Generate route — POST to backend, draw result
+  // Generate route — fast POST to backend; animation plays while we wait
   // ---------------------------------------------------------------------------
 
   function generateRoute() {
@@ -566,8 +645,11 @@
       return;
     }
 
-    setStatus("Generating route...");
+    setStatus("");
+    clearRouteVisuals();
+    routeStatsEl.hidden = true;
     setLoading(true);
+    startGenerationViz(startPoint, targetKm);
     generateBtn.disabled = true;
 
     fetch(API_GENERATE_ROUTE, {
@@ -595,11 +677,13 @@
         });
       })
       .then(function (route) {
+        stopGenerationViz();
         drawRoute({ type: "LineString", coordinates: route.coordinates });
         showRouteStats(route);
         setStatus("Route ready.");
       })
       .catch(function (err) {
+        stopGenerationViz();
         console.error(err);
         setStatus(err.message || "Could not reach the backend. Make sure it is running.", true);
         routeStatsEl.hidden = true;

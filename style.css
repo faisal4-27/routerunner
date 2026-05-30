@@ -77,19 +77,23 @@ b {
   overflow: hidden;
 }
 
-/* Spinner overlay shown while a route is generating. */
+/* Compact status pill shown while a route is generating. It sits at the top
+   of the map so the live "show the work" animation underneath stays visible. */
 .map-loading {
   position: absolute;
-  inset: 0;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
   z-index: 1200;
   display: flex;
-  flex-direction: column;
   align-items: center;
-  justify-content: center;
-  gap: 0.85rem;
-  background: rgba(247, 249, 253, 0.62);
-  backdrop-filter: blur(1.5px);
-  border-radius: 10px;
+  gap: 0.55rem;
+  max-width: calc(100% - 24px);
+  padding: 0.45rem 0.85rem;
+  background: rgba(255, 255, 255, 0.94);
+  border: 1px solid #ecc8b7;
+  border-radius: 999px;
+  box-shadow: 0 3px 12px rgba(20, 31, 46, 0.16);
 }
 
 .map-loading[hidden] {
@@ -97,17 +101,21 @@ b {
 }
 
 .spinner {
-  width: 56px;
-  height: 56px;
-  border: 5px solid rgba(252, 76, 2, 0.22);
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  border: 3px solid rgba(252, 76, 2, 0.25);
   border-top-color: #fc4c02;
   border-radius: 50%;
   animation: spin 0.8s linear infinite;
 }
 
 .map-loading-text {
-  font-size: 0.95rem;
+  font-size: 0.86rem;
   color: #2a3550;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 @keyframes spin {
