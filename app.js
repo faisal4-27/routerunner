@@ -68,6 +68,7 @@
   var statMaxClimb    = document.getElementById("stat-max-climb");
   var statSignals     = document.getElementById("stat-signals");
   var statusMsg       = document.getElementById("status-msg");
+  var mapLoading      = document.getElementById("map-loading");
 
   // ---------------------------------------------------------------------------
   // Mutable state
@@ -192,6 +193,11 @@
     statusMsg.classList.toggle("error", Boolean(isError));
   }
 
+  function setLoading(active) {
+    if (!mapLoading) { return; }
+    mapLoading.hidden = !active;
+  }
+
   // ---------------------------------------------------------------------------
   // Geometry helpers (used for drawing arrows and overlap offsets)
   // ---------------------------------------------------------------------------
@@ -243,54 +249,88 @@
     routeLayer = routeDirectionLayer = routeOverlapLayer = routeHighlightLayer = null;
   }
 
+  // Walk inward from one end of the polyline until we're at least `minM`
+  // away from the endpoint, so the local route direction is stable even when
+  // OSRM packs several tiny vertices right at the start/finish.
+  function pointAtLeastMetersFromEnd(coordsLngLat, fromStart, minM) {
+    if (fromStart) {
+      var base = coordsLngLat[0];
+      for (var i = 1; i < coordsLngLat.length; i++) {
+        if (approxDistanceMeters(base, coordsLngLat[i]) >= minM) {
+          return coordsLngLat[i];
+        }
+      }
+      return coordsLngLat[coordsLngLat.length - 1];
+    }
+    var last = coordsLngLat[coordsLngLat.length - 1];
+    for (var j = coordsLngLat.length - 2; j >= 0; j--) {
+      if (approxDistanceMeters(last, coordsLngLat[j]) >= minM) {
+        return coordsLngLat[j];
+      }
+    }
+    return coordsLngLat[0];
+  }
+
   /**
-   * Drop a labelled START flag at coords[0] and a labelled FINISH flag at
-   * coords[-1]. No road strips — the bold uppercase labels are the only
-   * decoration the user asked for, and they're plenty on their own.
+   * Drop ONE labelled "START/FINISH" marker on the loop.
    *
-   * Every route this app produces is a closed loop, so the FINISH coord
-   * normally snaps to the same place as START. We nudge the finish marker
-   * ~25 m east so the two labels never sit on top of each other.
+   * Every route this app produces is a closed loop, so start and finish are
+   * essentially the same coordinate — a single combined label reads better
+   * than two flags fighting for the same pixel.
+   *
+   * To keep the label off the route line, we look at the two directions the
+   * route leaves the start point (outbound + inbound) and push the label the
+   * opposite way — into the open space on the outside of the loop.
    */
   function drawStartEndHighlights(coordsLngLat) {
     if (!Array.isArray(coordsLngLat) || coordsLngLat.length < 2) { return; }
     routeHighlightLayer = L.layerGroup().addTo(map);
 
     var start = coordsLngLat[0];
-    var end   = coordsLngLat[coordsLngLat.length - 1];
 
-    var FINISH_NUDGE_LNG_DEG = 0.00028;
-    var endForMarker = approxDistanceMeters(start, end) < 8
-      ? [end[0] + FINISH_NUDGE_LNG_DEG, end[1]]
-      : end;
+    // Two directions the route emanates from the start: the first outbound
+    // segment, and the last inbound segment (taken as start → previous point).
+    var outAt  = pointAtLeastMetersFromEnd(coordsLngLat, true, 18);
+    var backAt = pointAtLeastMetersFromEnd(coordsLngLat, false, 18);
+    var dirOut  = segmentBearingDeg(start, outAt);
+    var dirBack = segmentBearingDeg(start, backAt);
 
-    var startFlagHtml =
-      '<div class="route-flag route-flag-start">' +
-        '<div class="route-flag-label route-flag-label-start">START</div>' +
+    // Unit vectors (east = sin(bearing), north = cos(bearing)). The sum points
+    // along the route's average heading; the label goes the opposite way.
+    var ox = Math.sin((dirOut * Math.PI) / 180);
+    var oy = Math.cos((dirOut * Math.PI) / 180);
+    var bx = Math.sin((dirBack * Math.PI) / 180);
+    var by = Math.cos((dirBack * Math.PI) / 180);
+    var sx = ox + bx;
+    var sy = oy + by;
+    var mag = Math.sqrt(sx * sx + sy * sy);
+
+    var awayX, awayY;
+    if (mag < 0.15) {
+      // Outbound and inbound nearly opposite (route passes straight through):
+      // there's no clear "outside", so step perpendicular to the route.
+      awayX = oy;
+      awayY = -ox;
+    } else {
+      awayX = -sx / mag;
+      awayY = -sy / mag;
+    }
+
+    var LABEL_OFFSET_M = 38;
+    var labelPoint = offsetPointLngLat(start, awayX, awayY, LABEL_OFFSET_M);
+
+    var flagHtml =
+      '<div class="route-flag route-flag-startfinish">' +
+        '<div class="route-flag-label">START/FINISH</div>' +
       '</div>';
 
-    L.marker([start[1], start[0]], {
+    L.marker([labelPoint[1], labelPoint[0]], {
       interactive: false, keyboard: false, zIndexOffset: 1000,
       icon: L.divIcon({
-        className: "start-flag-icon",
-        html: startFlagHtml,
-        iconSize:   [110, 36],
-        iconAnchor: [0, 18],
-      }),
-    }).addTo(routeHighlightLayer);
-
-    var finishFlagHtml =
-      '<div class="route-flag route-flag-finish">' +
-        '<div class="route-flag-label route-flag-label-finish">FINISH</div>' +
-      '</div>';
-
-    L.marker([endForMarker[1], endForMarker[0]], {
-      interactive: false, keyboard: false, zIndexOffset: 1000,
-      icon: L.divIcon({
-        className: "finish-flag-icon",
-        html: finishFlagHtml,
-        iconSize:   [110, 36],
-        iconAnchor: [55, 18],
+        className: "startfinish-flag-icon",
+        html: flagHtml,
+        iconSize:   [150, 34],
+        iconAnchor: [75, 17],
       }),
     }).addTo(routeHighlightLayer);
   }
@@ -526,7 +566,8 @@
       return;
     }
 
-    setStatus("Building route…");
+    setStatus("Generating route...");
+    setLoading(true);
     generateBtn.disabled = true;
 
     fetch(API_GENERATE_ROUTE, {
@@ -565,6 +606,7 @@
         clearRouteVisuals();
       })
       .finally(function () {
+        setLoading(false);
         generateBtn.disabled = false;
       });
   }

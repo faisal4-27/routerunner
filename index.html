@@ -24,9 +24,11 @@
       crossorigin=""
     />
 
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="" />
     <link
       rel="stylesheet"
-      href="https://cdn.jsdelivr.net/npm/@fontsource/iosevka-charon@5.2.5/index.css"
+      href="https://fonts.googleapis.com/css2?family=Homenaje&display=swap"
     />
 
     <!-- Your app’s layout and colors -->
@@ -36,11 +38,6 @@
     <main class="page-shell">
       <header class="intro">
         <h1 class="app-title">Route Runner</h1>
-        <p class="intro-copy">
-          Visiting a new city, meeting up with a friend, or just want a new
-          route? Simply choose a start point and a distance, hit enter, and
-          start running.
-        </p>
       </header>
 
       <section class="map-frame" role="region" aria-label="Route options and map">
@@ -96,7 +93,23 @@
           <p id="status-msg" class="status-msg" role="status"></p>
         </div>
 
-        <div id="map" aria-label="Interactive map"></div>
+        <div class="map-wrap">
+          <div id="map" aria-label="Interactive map"></div>
+          <div id="map-loading" class="map-loading" role="status" aria-label="Generating route" hidden>
+            <div class="spinner"></div>
+            <span class="map-loading-text">Generating route…</span>
+          </div>
+        </div>
+        <p class="project-blurb">
+          Route Runner generates looped running routes from a chosen start point
+          and target distance. The backend places waypoints around a virtual
+          circle, repeatedly asks OSRM for foot routes to tune distance accuracy,
+          and scores candidate loops to prefer routes that stay close to the
+          requested distance while reducing short U-turns and double-backs. The
+          stack uses Leaflet and vanilla JavaScript on the frontend with a FastAPI
+          + Python backend, plus OSRM routing, Overpass traffic-signal lookups,
+          and Open-Meteo elevation sampling.
+        </p>
       </section>
     </main>
 
@@ -111,7 +124,7 @@
       sure that backend's CORS_ORIGINS env var lists this frontend's origin.
     -->
     <script>
-      window.ROUTERUNNER_API_BASE_URL = "https://routerunner-1pk0.onrender.com";
+      //window.ROUTERUNNER_API_BASE_URL = "https://routerunner-1pk0.onrender.com";
     </script>
 
     <!--
