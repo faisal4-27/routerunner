@@ -11,10 +11,14 @@ How it works:
    so OSRM doesn't have to serialize the polyline every time.
 4. Compare the total routed distance against the target; if it's outside
    ±8 %, push each waypoint inward or outward, weighted by how off its own
-   leg was, and rebuild. Up to 6 distance iterations per layout.
-5. Fetch the polyline once for the layout we settle on. If it reuses any
-   streets in both directions, rotate the whole circle by a random 15–40°
-   and rebuild. Up to 4 layouts in total, keeping the cleanest result we saw.
+   leg was, and rebuild. Up to a few distance iterations per layout.
+5. Run several circle orientations *in parallel* (each its own asyncio task)
+   instead of one-after-another, so the wall-clock cost is roughly a single
+   layout's latency rather than the sum of all of them. Each layout fetches
+   its polyline once. We then rank every finished layout with a weighted
+   score — distance accuracy counts for 50 %, short U-turns 25 %, and
+   double-backs 25 % — and keep the best. A perfectly in-tolerance, clean
+   loop still wins outright and is returned as soon as the layouts resolve.
 6. Enrich the chosen route with traffic-signal and elevation data in parallel.
 """
 
@@ -51,7 +55,9 @@ ANGLE_STEP_DEG = 360.0 / NUM_POINTS
 # noticeably faster than the 6-iteration default when convergence drags.
 DISTANCE_ITERATIONS = 4
 
-# How many times to rotate the whole circle when fighting double-backs.
+# How many circle orientations to try. They run concurrently and the best
+# (or first flawless) layout wins, so this trades a few parallel OSRM calls
+# for better odds of a clean, on-distance loop without adding wall-clock time.
 ROTATION_ATTEMPTS = 4
 
 # Accept any route whose total length is within this fraction of the target.
@@ -144,6 +150,48 @@ def _adjust_scales(
     return new_scales
 
 
+# Soft caps used to normalise the raw penalties onto a comparable 0–1 scale
+# before they're combined. A route 50 %+ off target, or with 4+ short U-turns
+# / double-backs, already pegs its component at the maximum penalty.
+DIST_ERROR_CAP_FRAC = 0.5
+UTURN_CAP = 4.0
+DOUBLE_BACK_CAP = 4.0
+
+# Part-B ranking weights. Distance accuracy dominates (50 %), with the two
+# geometry-quality penalties splitting the rest evenly (25 % each).
+WEIGHT_DISTANCE = 0.5
+WEIGHT_UTURN = 0.25
+WEIGHT_DOUBLE_BACK = 0.25
+
+
+def _candidate_score(
+    total_m: float,
+    target_m: float,
+    short_uturns: int,
+    double_backs: int,
+) -> float:
+    """
+    Weighted quality score for a finished layout — lower is better.
+
+    Each of the three raw penalties is normalised to roughly 0–1 so the
+    weights mean what they say:
+
+    * distance accuracy — relative error vs. target, capped at 50 % off (50 %)
+    * short U-turns — count, capped at 4 (25 %)
+    * double-backs — count, capped at 4 (25 %)
+    """
+    rel_error = abs(target_m - total_m) / target_m if target_m else 1.0
+    dist_penalty = min(1.0, rel_error / DIST_ERROR_CAP_FRAC)
+    uturn_penalty = min(1.0, short_uturns / UTURN_CAP)
+    double_back_penalty = min(1.0, double_backs / DOUBLE_BACK_CAP)
+
+    return (
+        WEIGHT_DISTANCE * dist_penalty
+        + WEIGHT_UTURN * uturn_penalty
+        + WEIGHT_DOUBLE_BACK * double_back_penalty
+    )
+
+
 async def _enrich(
     client: httpx.AsyncClient,
     coords: List[LngLat],
@@ -177,103 +225,144 @@ async def _enrich(
     )
 
 
+class _Candidate(dict):
+    """A finished layout: coords, total_m, geometry penalties, and score."""
+
+
+async def _run_attempt(
+    client: httpx.AsyncClient,
+    lat: float,
+    lng: float,
+    base_radius_m: float,
+    rotation_deg: float,
+    target_m: float,
+    tolerance_m: float,
+) -> Tuple[_Candidate | None, Exception | None]:
+    """
+    Tune one circle orientation to the target distance and score the result.
+
+    Runs the inner distance-tuning loop (cheap overview=false calls), fetches
+    the polyline once for the layout it settles on, then computes the weighted
+    quality score. Returns (candidate, None) on success or (None, error) if
+    OSRM never produced a usable layout — the caller decides what to do with a
+    batch of these results.
+
+    `base_radius_m` is taken by value, so each parallel attempt owns its radius
+    and a transient OSRM failure in one orientation can't bloat the others.
+    """
+    scales = [1.0] * NUM_POINTS
+    radius_m = base_radius_m
+    chosen_points: List[Tuple[float, float]] | None = None
+    last_error: Exception | None = None
+
+    # Tuning loop: ask OSRM for distances only (overview=false) — the payload
+    # is dramatically smaller than the polyline version, so iteration is much
+    # faster. Geometry is fetched once at the end.
+    for _ in range(DISTANCE_ITERATIONS):
+        points = _build_waypoints(lat, lng, radius_m, rotation_deg, scales)
+
+        try:
+            result = await fetch_osrm_route_through_points(
+                client, _closed_loop(points), want_geometry=False
+            )
+        except OsrmError as exc:
+            # Transient OSRM trouble — widen the circle and try again.
+            last_error = exc
+            radius_m *= 1.1
+            continue
+
+        leg_distances = result["leg_distances"]
+        total_m = result["total_distance"]
+        chosen_points = points
+
+        if abs(target_m - total_m) <= tolerance_m:
+            break
+
+        scales = _adjust_scales(scales, leg_distances, target_m)
+
+    if chosen_points is None:
+        return None, last_error
+
+    # One geometry fetch for the layout we settled on.
+    try:
+        final_result = await fetch_osrm_route_through_points(
+            client, _closed_loop(chosen_points), want_geometry=True
+        )
+    except OsrmError as exc:
+        return None, exc
+
+    coords = final_result["coordinates"] or []
+    total_m = final_result["total_distance"]
+    short_uturns = count_short_uturns(coords, SHORT_STREET_M)
+    double_backs = count_double_back_segments(coords)
+
+    candidate = _Candidate(
+        coords=coords,
+        total_m=total_m,
+        short_uturns=short_uturns,
+        double_backs=double_backs,
+        in_tolerance=abs(target_m - total_m) <= tolerance_m,
+        score=_candidate_score(total_m, target_m, short_uturns, double_backs),
+    )
+    return candidate, None
+
+
 async def generate_route(
     lat: float, lng: float, distance_km: float
 ) -> RouteCandidate:
     """
     Build one loop close to `distance_km` and return it enriched with stats.
 
-    The function tries up to ROTATION_ATTEMPTS different circle orientations.
-    Each orientation runs an inner distance-tuning loop. If we ever find an
-    in-tolerance, zero-double-back loop we return immediately; otherwise we
-    return the loop with the fewest double-backs we saw along the way.
+    All ROTATION_ATTEMPTS circle orientations run concurrently, so the
+    wall-clock cost is roughly one layout's latency instead of the sum of
+    them. A flawless loop (in tolerance, no short U-turn, no double-back)
+    wins outright; otherwise the layouts are ranked by a weighted score that
+    is 50 % distance accuracy, 25 % short U-turns, and 25 % double-backs, and
+    the best one is returned.
     """
     target_m = distance_km * 1000.0
     base_radius_m = target_m / (2.0 * math.pi)
     tolerance_m = max(150.0, target_m * DISTANCE_TOLERANCE_FRAC)
 
-    # Quality score is (short_uturns, double_backs) — strictly less is
-    # better, so any route with a short U-turn loses to one without.
-    best_coords: List[LngLat] | None = None
-    best_total_m = 0.0
-    best_score: Tuple[int, int] = (10**9, 10**9)
-    last_error: Exception | None = None
-    # Random initial rotation so repeated clicks on the same start point
-    # don't keep producing the identical loop (and identical elevation /
-    # signal stats). Each retry then adds a chunky 15–40° offset on top.
-    rotation_deg = random.uniform(0.0, 360.0)
+    # Spread the orientations evenly around the circle with a random phase, so
+    # repeated clicks on the same start don't reproduce an identical loop and
+    # the parallel attempts explore genuinely different layouts.
+    phase = random.uniform(0.0, 360.0)
+    step = 360.0 / ROTATION_ATTEMPTS
+    rotations = [
+        (phase + i * step + random.uniform(-10.0, 10.0)) % 360.0
+        for i in range(ROTATION_ATTEMPTS)
+    ]
 
     async with httpx.AsyncClient() as client:
-        for _ in range(ROTATION_ATTEMPTS):
-            scales = [1.0] * NUM_POINTS
-            chosen_points: List[Tuple[float, float]] | None = None
-
-            # Tuning loop: ask OSRM for distances only (overview=false) — the
-            # payload is dramatically smaller than the polyline version, so
-            # iteration is much faster. Geometry is fetched once at the end.
-            for _ in range(DISTANCE_ITERATIONS):
-                points = _build_waypoints(
-                    lat, lng, base_radius_m, rotation_deg, scales
+        results = await asyncio.gather(
+            *(
+                _run_attempt(
+                    client, lat, lng, base_radius_m, rot, target_m, tolerance_m
                 )
+                for rot in rotations
+            )
+        )
 
-                try:
-                    result = await fetch_osrm_route_through_points(
-                        client, _closed_loop(points), want_geometry=False
-                    )
-                except OsrmError as exc:
-                    # Transient OSRM trouble — widen the circle and try again.
-                    last_error = exc
-                    base_radius_m *= 1.1
-                    continue
+        candidates = [c for c, _ in results if c is not None]
+        last_error = next((e for _, e in results if e is not None), None)
 
-                leg_distances = result["leg_distances"]
-                total_m = result["total_distance"]
-                chosen_points = points
+        if not candidates:
+            raise last_error or OsrmError(
+                "Could not generate a route close enough to the target "
+                "distance. Try a different start point or distance."
+            )
 
-                if abs(target_m - total_m) <= tolerance_m:
-                    break
+        # A flawless loop wins regardless of score; among several, take the
+        # one with the best (lowest) weighted score.
+        flawless = [
+            c
+            for c in candidates
+            if c["in_tolerance"]
+            and c["short_uturns"] == 0
+            and c["double_backs"] == 0
+        ]
+        pool = flawless or candidates
+        best = min(pool, key=lambda c: c["score"])
 
-                scales = _adjust_scales(scales, leg_distances, target_m)
-
-            if chosen_points is not None:
-                # One geometry fetch for the layout we settled on.
-                try:
-                    final_result = await fetch_osrm_route_through_points(
-                        client, _closed_loop(chosen_points), want_geometry=True
-                    )
-                except OsrmError as exc:
-                    last_error = exc
-                    rotation_deg = (
-                        rotation_deg + random.uniform(15.0, 40.0)
-                    ) % 360.0
-                    continue
-
-                coords = final_result["coordinates"] or []
-                total_m = final_result["total_distance"]
-                short_uturns = count_short_uturns(coords, SHORT_STREET_M)
-                double_backs = count_double_back_segments(coords)
-                score = (short_uturns, double_backs)
-
-                # Perfect run: in distance, no short U-turn, no double-back.
-                if (
-                    abs(target_m - total_m) <= tolerance_m
-                    and short_uturns == 0
-                    and double_backs == 0
-                ):
-                    return await _enrich(client, coords, total_m)
-
-                if score < best_score:
-                    best_coords = coords
-                    best_total_m = total_m
-                    best_score = score
-
-            # Rotate the whole circle by a chunky random offset and try again.
-            rotation_deg = (rotation_deg + random.uniform(15.0, 40.0)) % 360.0
-
-        if best_coords is not None:
-            return await _enrich(client, best_coords, best_total_m)
-
-    raise last_error or OsrmError(
-        "Could not generate a route close enough to the target distance. "
-        "Try a different start point or distance."
-    )
+        return await _enrich(client, best["coords"], best["total_m"])
