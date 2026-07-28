@@ -3,7 +3,8 @@
 A web app that generates running routes based on a selected location and distance, minimizing traffic signals encountered.
 
 ## Features
-- Click anywhere on the map to set your starting point
+- Search for an address, street, or city to set your starting point
+- Or click anywhere on the map to set it manually
 - Select your desired distance
 - Get a generated loop route
 - See elevation data and traffic signal count
@@ -12,6 +13,7 @@ A web app that generates running routes based on a selected location and distanc
 - HTML / CSS / JavaScript
 - Leaflet.js
 - OSRM (routing)
+- Photon (location search)
 - Overpass API (traffic signal lookup)
 - Open-Meteo (elevation)
 - FastAPI + httpx (Python backend)

@@ -141,6 +141,133 @@ b {
   color: #fc4c02;
 }
 
+.search-field {
+  position: relative;
+}
+
+.search-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.search-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 0.42rem 0.55rem;
+  font: inherit;
+  font-size: 0.92rem;
+  color: #1f2630;
+  background: #fff;
+  border: 1px solid #c5cee0;
+  border-radius: 6px;
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+.search-input:focus-visible {
+  outline: 2px solid #fc4c02;
+  outline-offset: 1px;
+  border-color: #fc4c02;
+}
+
+.search-btn {
+  flex: 0 0 auto;
+  padding: 0.42rem 0.75rem;
+  font: inherit;
+  font-size: 0.9rem;
+  color: #2a3550;
+  background: #f2f5fb;
+  border: 1px solid #c5cee0;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.search-btn:hover {
+  background: #e7ecf7;
+}
+
+.search-btn:focus-visible {
+  outline: 2px solid #fc4c02;
+  outline-offset: 2px;
+}
+
+.search-btn:disabled {
+  cursor: progress;
+  opacity: 0.6;
+}
+
+/* The match list overlays the panel instead of pushing the controls down.
+   Leaflet's map panes sit at z-index 400, so this has to clear that. */
+.search-results {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  z-index: 1000;
+  max-height: 232px;
+  margin: 0;
+  padding: 0.25rem;
+  overflow-y: auto;
+  list-style: none;
+  background: #fff;
+  border: 1px solid #c5cee0;
+  border-radius: 8px;
+  box-shadow: 0 8px 20px rgba(20, 31, 46, 0.16);
+}
+
+.search-results[hidden] {
+  display: none;
+}
+
+.search-result-btn {
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+  width: 100%;
+  padding: 0.45rem 0.55rem;
+  font: inherit;
+  text-align: left;
+  color: #253047;
+  background: none;
+  border: none;
+  border-radius: 5px;
+  cursor: pointer;
+}
+
+/* `is-active` is the arrow-key highlight; it matches hover so both feel the
+   same whether the user is on a mouse or the keyboard. */
+.search-result-btn:hover,
+.search-result-btn:focus-visible,
+.search-result-btn.is-active {
+  outline: none;
+  background: #fff1ea;
+  color: #b93a02;
+}
+
+.search-result-primary {
+  font-size: 0.9rem;
+  line-height: 1.3;
+}
+
+.search-result-secondary {
+  font-size: 0.78rem;
+  line-height: 1.25;
+  color: #6b7690;
+}
+
+.search-result-btn:hover .search-result-secondary,
+.search-result-btn:focus-visible .search-result-secondary,
+.search-result-btn.is-active .search-result-secondary {
+  color: #a8562f;
+}
+
+.search-empty {
+  padding: 0.45rem 0.55rem;
+  font-size: 0.84rem;
+  color: #6b7690;
+}
+
 #distance-slider {
   width: 100%;
 }
@@ -247,7 +374,7 @@ b {
 
 .hint {
   margin: 0;
-  flex: 1 1 280px;
+  flex: 1 1 100%;
   font-size: 0.84rem;
   line-height: 1.35;
   color: #445068;

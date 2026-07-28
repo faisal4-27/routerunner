@@ -43,8 +43,27 @@
       <section class="map-frame" role="region" aria-label="Route options and map">
         <div class="control-panel">
           <p class="hint">
-            Choose a start point by clicking anywhere on the map.
+            Search for a location below, or click anywhere on the map, to choose
+            your start point.
           </p>
+
+          <div class="field search-field" id="location-search-field">
+            <label for="location-search">Start location</label>
+            <div class="search-row">
+              <input
+                id="location-search"
+                type="search"
+                class="search-input"
+                placeholder="Address, street, or city"
+                autocomplete="off"
+              />
+              <button type="button" id="location-search-btn" class="search-btn">
+                Search
+              </button>
+            </div>
+            <!-- Filled by app.js with the matches for the typed query -->
+            <ul id="location-results" class="search-results" hidden></ul>
+          </div>
 
           <div class="field">
             <label for="distance-slider">
@@ -107,8 +126,8 @@
           and scores candidate loops to prefer routes that stay close to the
           requested distance while reducing short U-turns and double-backs. The
           stack uses Leaflet and vanilla JavaScript on the frontend with a FastAPI
-          + Python backend, plus OSRM routing, Overpass traffic-signal lookups,
-          and Open-Meteo elevation sampling.
+          + Python backend, plus OSRM routing, Photon location search, Overpass
+          traffic-signal lookups, and Open-Meteo elevation sampling.
         </p>
       </section>
     </main>

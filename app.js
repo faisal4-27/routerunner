@@ -3,7 +3,8 @@
  *
  * Flow:
  * 1) On load, try to get the user's location and drop a marker there.
- * 2) User can click anywhere on the map to move the start marker.
+ * 2) User can search for an address/place, or click anywhere on the map, to
+ *    move the start marker — geolocation is often denied or unavailable.
  * 3) User picks a distance on the slider and clicks Generate.
  * 4) One POST to the FastAPI backend → draws the returned loop + stats.
  */
@@ -24,6 +25,22 @@
     (typeof window !== "undefined" && window.ROUTERUNNER_API_BASE_URL) ||
     window.location.protocol + "//" + window.location.hostname + ":8000";
   var API_GENERATE_ROUTE = API_BASE_URL.replace(/\/$/, "") + "/generate-route";
+
+  // Location search (geocoding) is called straight from the browser rather
+  // than proxied through our backend. The provider rate-limits per IP, so
+  // going direct gives every visitor their own budget instead of sharing the
+  // server's, and search keeps working while a sleeping backend wakes up.
+  //
+  // Photon rather than Nominatim: suggestions update as the user types, and
+  // Nominatim's usage policy explicitly rules out per-keystroke autocomplete
+  // traffic. Photon is built for it and runs on the same OSM data.
+  var PHOTON_SEARCH_URL = "https://photon.komoot.io/api/";
+  var GEOCODE_RESULT_LIMIT = 5;
+  // Below 3 characters almost everything matches, so it's noise for the user
+  // and needless traffic for a free service.
+  var GEOCODE_MIN_QUERY_LEN = 3;
+  // Wait out a burst of typing before firing a request.
+  var GEOCODE_DEBOUNCE_MS = 250;
 
   // Visual constants
   var OVERLAP_MIN_SEGMENT_M = 25;
@@ -69,6 +86,10 @@
   var statusMsg       = document.getElementById("status-msg");
   var mapLoading      = document.getElementById("map-loading");
   var mapLoadingText  = document.getElementById("map-loading-text");
+  var searchField     = document.getElementById("location-search-field");
+  var searchInput     = document.getElementById("location-search");
+  var searchBtn       = document.getElementById("location-search-btn");
+  var searchResults   = document.getElementById("location-results");
 
   // ---------------------------------------------------------------------------
   // Mutable state
@@ -90,7 +111,17 @@
   // Start-point helpers
   // ---------------------------------------------------------------------------
 
-  function setStartPoint(lat, lng, shouldCenterMap) {
+  /**
+   * Move the start marker to (lat, lng) and remember it as the route origin.
+   *
+   * `view` is optional and controls whether the map moves too:
+   *   - { bounds: L.LatLngBounds } frames an area — used for search matches,
+   *     so "Toronto" fits the city while a street address still lands close
+   *     in (fitBounds caps the zoom at USER_LOCATION_ZOOM).
+   *   - { zoom: n } jumps to the point at a fixed zoom.
+   *   - omitted leaves the current view exactly where it is.
+   */
+  function setStartPoint(lat, lng, view) {
     var ll = L.latLng(lat, lng);
     startPoint = { lat: ll.lat, lng: ll.lng };
 
@@ -100,8 +131,10 @@
       startMarker.setLatLng(ll);
     }
 
-    if (shouldCenterMap) {
-      map.setView(ll, USER_LOCATION_ZOOM);
+    if (view && view.bounds) {
+      map.fitBounds(view.bounds, { padding: [24, 24], maxZoom: USER_LOCATION_ZOOM });
+    } else if (view && view.zoom) {
+      map.setView(ll, view.zoom);
     }
   }
 
@@ -118,22 +151,32 @@
   // - enableHighAccuracy is false on purpose: rough city-block accuracy is
   //   plenty for centring the map and avoids the aggressive permission
   //   prompts (and battery drain) that high-accuracy GPS triggers on mobile.
+  // - Caveat for location search: each search sends the typed text and the
+  //   current map centre to Photon (komoot.io). If the map is centred on the
+  //   user, that centre implies their rough area — so searching does reveal an
+  //   approximate location to that third party, though never to us. Because
+  //   suggestions update while typing, this happens once per burst of
+  //   keystrokes rather than only on submit.
   function initializeUserLocation() {
     if (!navigator.geolocation) {
-      setStatus("Showing default map location — click anywhere to set your start point.");
+      setStatus("Search for a location, or click the map, to set your start point.");
       return;
     }
 
     setStatus("Finding your location…");
     navigator.geolocation.getCurrentPosition(
       function (pos) {
-        setStartPoint(pos.coords.latitude, pos.coords.longitude, true);
+        // The permission prompt can sit open for a while. If the user already
+        // searched or clicked a start point in the meantime, leave it alone.
+        if (startPoint) { return; }
+        setStartPoint(pos.coords.latitude, pos.coords.longitude, { zoom: USER_LOCATION_ZOOM });
         setStatus("Start point set to your location. Click anywhere to move it.");
       },
       function () {
         // Permission denied or timed out — fall back gracefully without
-        // alarming the user about it.
-        setStatus("Showing default map location — click anywhere to set your start point.");
+        // alarming the user about it. Search is the way out of this state.
+        if (startPoint) { return; }
+        setStatus("Couldn't get your location — search for a place, or click the map.");
       },
       // timeout is generous (20s) because the geolocation timer starts
       // immediately and includes the time the user spends on the
@@ -142,6 +185,234 @@
       // reason "Allow location" appears to do nothing.
       { enableHighAccuracy: false, timeout: 20000, maximumAge: 300000 }
     );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Location search (Photon geocoding)
+  //
+  // Suggestions appear under the box while the user types. Requests are
+  // debounced and the previous one is aborted, so a burst of keystrokes costs
+  // one request and a slow early reply can never overwrite a newer one.
+  // Nothing moves the map until a suggestion is actually chosen.
+  // ---------------------------------------------------------------------------
+
+  /** @type {AbortController|null} In-flight search, so a stale reply can't win. */
+  var geocodeAbort = null;
+  /** @type {number|null} Pending debounce timer. */
+  var geocodeTimer = null;
+  /** @type {Array<Object>} Matches currently listed under the search box. */
+  var searchMatches = [];
+  /** Index of the keyboard-highlighted row, or -1 when none is. */
+  var activeMatchIndex = -1;
+
+  function buildGeocodeUrl(query) {
+    var center = map.getCenter();
+    // lat/lon bias ranks nearby places first without hiding distant ones, so
+    // "main street" prefers the one near the map the user is looking at.
+    return (
+      PHOTON_SEARCH_URL +
+      "?limit=" + GEOCODE_RESULT_LIMIT +
+      "&lat=" + center.lat.toFixed(5) +
+      "&lon=" + center.lng.toFixed(5) +
+      "&q=" + encodeURIComponent(query)
+    );
+  }
+
+  /** Photon returns extent as [west, north, east, south]. */
+  function parseExtent(extent) {
+    if (!Array.isArray(extent) || extent.length < 4) { return null; }
+    var west  = parseFloat(extent[0]);
+    var north = parseFloat(extent[1]);
+    var east  = parseFloat(extent[2]);
+    var south = parseFloat(extent[3]);
+    if (![west, north, east, south].every(isFinite)) { return null; }
+    return L.latLngBounds([south, west], [north, east]);
+  }
+
+  /**
+   * Turn Photon's address fields into a headline plus a context line.
+   *
+   * Photon has no preformatted label (unlike Nominatim's display_name), so we
+   * assemble one: the place or street name on top, then enough administrative
+   * detail below to tell two same-named streets apart.
+   */
+  function formatPlaceParts(props) {
+    var street = props.street || "";
+    if (props.housenumber && street) { street = props.housenumber + " " + street; }
+
+    var primary =
+      props.name || street || props.city || props.state || props.country || "Unnamed place";
+
+    var context = [];
+    [street, props.city || props.locality || props.county, props.state, props.country]
+      .forEach(function (part) {
+        if (part && part !== primary && context.indexOf(part) === -1) { context.push(part); }
+      });
+
+    return { primary: primary, secondary: context.join(", ") };
+  }
+
+  function parseGeocodeResults(data) {
+    var features = data && Array.isArray(data.features) ? data.features : [];
+    var results = [];
+    var seenLabels = {};
+
+    features.forEach(function (feature) {
+      var coords = feature && feature.geometry && feature.geometry.coordinates;
+      if (!Array.isArray(coords) || coords.length < 2) { return; }
+      var lng = parseFloat(coords[0]);
+      var lat = parseFloat(coords[1]);
+      if (!isFinite(lat) || !isFinite(lng)) { return; }
+
+      var props = feature.properties || {};
+      var parts = formatPlaceParts(props);
+      var label = parts.secondary ? parts.primary + ", " + parts.secondary : parts.primary;
+
+      // A long street is many OSM ways, so one search can return several
+      // features that describe it identically. Rows the user can't tell apart
+      // are just noise — any segment works as a start point, so keep the first.
+      if (seenLabels[label]) { return; }
+      seenLabels[label] = true;
+
+      results.push({
+        primary:   parts.primary,
+        secondary: parts.secondary,
+        label:     label,
+        lat:       lat,
+        lng:       lng,
+        bounds:    parseExtent(props.extent),
+      });
+    });
+
+    return results;
+  }
+
+  // Dismiss the list and cancel anything still on its way, so a reply that
+  // lands after the user has moved on can't pop the suggestions back open.
+  function clearSearchResults() {
+    if (geocodeTimer) { clearTimeout(geocodeTimer); geocodeTimer = null; }
+    if (geocodeAbort) { geocodeAbort.abort(); geocodeAbort = null; }
+    searchMatches = [];
+    activeMatchIndex = -1;
+    searchResults.innerHTML = "";
+    searchResults.hidden = true;
+  }
+
+  function renderSearchResults(results) {
+    searchMatches = results;
+    activeMatchIndex = -1;
+    searchResults.innerHTML = "";
+
+    results.forEach(function (result) {
+      var item = document.createElement("li");
+      var button = document.createElement("button");
+      button.type = "button";
+      button.className = "search-result-btn";
+
+      // textContent, not innerHTML: these are third-party strings.
+      var primary = document.createElement("span");
+      primary.className = "search-result-primary";
+      primary.textContent = result.primary;
+      button.appendChild(primary);
+
+      if (result.secondary) {
+        var secondary = document.createElement("span");
+        secondary.className = "search-result-secondary";
+        secondary.textContent = result.secondary;
+        button.appendChild(secondary);
+      }
+
+      button.addEventListener("click", function () { chooseSearchResult(result); });
+      item.appendChild(button);
+      searchResults.appendChild(item);
+    });
+
+    searchResults.hidden = false;
+  }
+
+  // Shown in place of matches so the dead end is visible where the user is
+  // looking, instead of in the status line below the panel.
+  function renderNoMatches(query) {
+    searchMatches = [];
+    activeMatchIndex = -1;
+    searchResults.innerHTML = "";
+
+    var item = document.createElement("li");
+    item.className = "search-empty";
+    item.textContent = "No matches for “" + query + "”";
+    searchResults.appendChild(item);
+    searchResults.hidden = false;
+  }
+
+  function setActiveMatch(index) {
+    var buttons = searchResults.querySelectorAll(".search-result-btn");
+    if (!buttons.length) { return; }
+
+    activeMatchIndex = ((index % buttons.length) + buttons.length) % buttons.length;
+    for (var i = 0; i < buttons.length; i++) {
+      var isActive = i === activeMatchIndex;
+      buttons[i].classList.toggle("is-active", isActive);
+      if (isActive) { buttons[i].scrollIntoView({ block: "nearest" }); }
+    }
+  }
+
+  function chooseSearchResult(result) {
+    clearSearchResults();
+    // Programmatic assignment doesn't fire `input`, so this can't re-trigger
+    // a search and reopen the list we just closed.
+    searchInput.value = result.label;
+    setStartPoint(
+      result.lat,
+      result.lng,
+      result.bounds ? { bounds: result.bounds } : { zoom: USER_LOCATION_ZOOM }
+    );
+    setStatus("Start point set to " + result.primary + ". Click the map to fine-tune it.");
+  }
+
+  function queueLocationSearch() {
+    if (geocodeTimer) { clearTimeout(geocodeTimer); }
+    geocodeTimer = setTimeout(function () {
+      geocodeTimer = null;
+      runLocationSearch(false);
+    }, GEOCODE_DEBOUNCE_MS);
+  }
+
+  // `explicit` marks a deliberate Enter/button search, which is allowed to
+  // complain about a too-short query. Typing stays quiet.
+  function runLocationSearch(explicit) {
+    var query = (searchInput.value || "").trim();
+    if (query.length < GEOCODE_MIN_QUERY_LEN) {
+      clearSearchResults();
+      if (explicit) {
+        setStatus("Type at least " + GEOCODE_MIN_QUERY_LEN + " characters to search.", true);
+      }
+      return;
+    }
+
+    if (geocodeAbort) { geocodeAbort.abort(); }
+    var controller = new AbortController();
+    geocodeAbort = controller;
+
+    fetch(buildGeocodeUrl(query), { signal: controller.signal })
+      .then(function (res) {
+        if (!res.ok) { throw new Error("Location search failed (HTTP " + res.status + ")."); }
+        return res.json();
+      })
+      .then(function (data) {
+        var results = parseGeocodeResults(data);
+        if (!results.length) { renderNoMatches(query); return; }
+        renderSearchResults(results);
+      })
+      .catch(function (err) {
+        if (err && err.name === "AbortError") { return; }
+        console.error(err);
+        clearSearchResults();
+        setStatus("Couldn't search for that location. Check your connection and try again.", true);
+      })
+      .finally(function () {
+        // A newer search already owns the UI, so only the latest one clears.
+        if (geocodeAbort === controller) { geocodeAbort = null; }
+      });
   }
 
   // ---------------------------------------------------------------------------
@@ -700,8 +971,50 @@
   // ---------------------------------------------------------------------------
 
   map.on("click", function (ev) {
-    setStartPoint(ev.latlng.lat, ev.latlng.lng, false);
+    clearSearchResults();
+    setStartPoint(ev.latlng.lat, ev.latlng.lng);
     setStatus("Start point set. Adjust distance, then generate.");
+  });
+
+  // Typing drives the suggestions; the button forces an immediate search
+  // (handy for retrying after a network hiccup).
+  searchInput.addEventListener("input", queueLocationSearch);
+  searchBtn.addEventListener("click", function () { runLocationSearch(true); });
+
+  searchInput.addEventListener("keydown", function (ev) {
+    if (ev.key === "ArrowDown") {
+      ev.preventDefault();
+      if (searchMatches.length) { setActiveMatch(activeMatchIndex + 1); }
+      return;
+    }
+
+    if (ev.key === "ArrowUp") {
+      ev.preventDefault();
+      // From "nothing highlighted", Up should wrap to the bottom of the list.
+      if (searchMatches.length) {
+        setActiveMatch(activeMatchIndex <= 0 ? searchMatches.length - 1 : activeMatchIndex - 1);
+      }
+      return;
+    }
+
+    if (ev.key === "Enter") {
+      ev.preventDefault();
+      if (searchMatches.length) {
+        // Enter with nothing highlighted takes the top match.
+        chooseSearchResult(searchMatches[activeMatchIndex >= 0 ? activeMatchIndex : 0]);
+      } else {
+        // Typed and hit Enter before suggestions arrived — search right away.
+        runLocationSearch(true);
+      }
+      return;
+    }
+
+    if (ev.key === "Escape") { clearSearchResults(); }
+  });
+
+  // Clicking anywhere outside the search field dismisses the match list.
+  document.addEventListener("click", function (ev) {
+    if (!searchField.contains(ev.target)) { clearSearchResults(); }
   });
 
   // Slider → input: any slider movement overwrites the typed value with the
