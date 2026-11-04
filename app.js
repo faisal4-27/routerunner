@@ -25,6 +25,10 @@
     (typeof window !== "undefined" && window.ROUTERUNNER_API_BASE_URL) ||
     window.location.protocol + "//" + window.location.hostname + ":8000";
   var API_GENERATE_ROUTE = API_BASE_URL.replace(/\/$/, "") + "/generate-route";
+  // Traffic signals are fetched separately after the route is drawn: the
+  // public Overpass server can take 30 s+ under load and shouldn't hold the
+  // route back.
+  var API_ROUTE_SIGNALS = API_BASE_URL.replace(/\/$/, "") + "/route-signals";
 
   // Location search (geocoding) is called straight from the browser rather
   // than proxied through our backend. The provider rate-limits per IP, so
@@ -79,16 +83,29 @@
     iconAnchor: [15, 36],
   });
 
-  var FINISH_FLAG_ICON = L.divIcon({
-    className: "rr-marker rr-finish",
+  // Combined START/FINISH marker for a generated loop: a chequered lime flag
+  // whose pole stands in a square target. The anchor is the centre of that
+  // target, so it sits exactly on the route's first point at every zoom.
+  var START_FINISH_ICON = L.divIcon({
+    className: "rr-marker rr-startfinish",
     html:
-      '<div class="finish-flag">' +
-        '<svg viewBox="0 0 12 12" shape-rendering="crispEdges" aria-hidden="true">' +
-          '<path d="M1 0h2v12h-2z M3 1h7v1h1v4h-1v1h-7z"/>' +
-        "</svg>" +
-      "</div>",
-    iconSize: [34, 34],
-    iconAnchor: [17, 17],
+      // Drawn on a 34×46 grid and shown at 1.3× so it reads at a glance.
+      '<svg width="44" height="60" viewBox="0 0 34 46" shape-rendering="crispEdges" aria-hidden="true">' +
+        // pole
+        '<rect x="15" y="2" width="4" height="36" fill="#04111a"/>' +
+        '<rect x="16" y="3" width="2" height="34" fill="#f4ead2"/>' +
+        // flag with chequers
+        '<rect x="18" y="2" width="16" height="14" fill="#04111a"/>' +
+        '<rect x="18" y="3" width="15" height="12" fill="#b7f34a"/>' +
+        '<path d="M22 3h3v3h-3z M28 3h3v3h-3z M25 6h3v3h-3z M31 6h2v3h-2z' +
+        ' M22 9h3v3h-3z M28 9h3v3h-3z M25 12h3v3h-3z M31 12h2v3h-2z" fill="#04111a"/>' +
+        // target square on the route point
+        '<rect x="11" y="35" width="12" height="12" fill="#04111a"/>' +
+        '<rect x="13" y="37" width="8" height="8" fill="#b7f34a"/>' +
+        '<rect x="15" y="39" width="4" height="4" fill="#04111a"/>' +
+      "</svg>",
+    iconSize: [44, 60],
+    iconAnchor: [22, 53], // centre of the target square (17, 41) × 1.3
   });
 
   // ---------------------------------------------------------------------------
@@ -104,11 +121,9 @@
   var DISTANCE_MIN_KM = parseFloat(slider.min);
   var DISTANCE_MAX_KM = parseFloat(slider.max);
   var statDistance    = document.getElementById("stat-distance");
-  var statTime        = document.getElementById("stat-time");
-  var statPace        = document.getElementById("stat-pace");
-  var statGain        = document.getElementById("stat-elevation-gain");
   var statMaxClimb    = document.getElementById("stat-max-climb");
   var statSignals     = document.getElementById("stat-signals");
+  var signalsUnit     = document.getElementById("signals-unit");
   var statusMsg       = document.getElementById("status-msg");
   var mapLoading      = document.getElementById("map-loading");
   var mapLoadingText  = document.getElementById("map-loading-text");
@@ -137,10 +152,6 @@
 
   document.getElementById("range-min-label").textContent = formatKm(DISTANCE_MIN_KM);
   document.getElementById("range-max-label").textContent = formatKm(DISTANCE_MAX_KM);
-
-  // The backend doesn't know the runner's speed, so time is estimated from a
-  // steady recreational pace. Change this one number to retune the estimate.
-  var ASSUMED_PACE_SEC_PER_KM = 6 * 60;
 
   // Palette shared with style.css (Leaflet paths take colours, not classes).
   var COLOR_ORANGE = "#ff5c35";
@@ -201,6 +212,9 @@
       }).addTo(map);
     } else {
       startMarker.setLatLng(ll);
+      // A new start point is being chosen, so show the pin again even if the
+      // previous route's START/FINISH marker is still on the map.
+      startMarker.setOpacity(1);
     }
 
     startLabel = label || "Custom start point";
@@ -555,14 +569,6 @@
     return Math.abs(value).toFixed(4) + "° " + (value >= 0 ? positive : negative);
   }
 
-  /** Seconds → "m:ss" (pace) */
-  function formatMinSec(totalSec) {
-    var s = Math.round(totalSec);
-    var m = Math.floor(s / 60);
-    var r = s % 60;
-    return m + ":" + (r < 10 ? "0" : "") + r;
-  }
-
   function pad2(n) {
     return (n < 10 ? "0" : "") + n;
   }
@@ -819,92 +825,33 @@
       if (l) { map.removeLayer(l); }
     });
     routeLayer = routeDirectionLayer = routeOverlapLayer = routeHighlightLayer = null;
-  }
-
-  // Walk inward from one end of the polyline until we're at least `minM`
-  // away from the endpoint, so the local route direction is stable even when
-  // OSRM packs several tiny vertices right at the start/finish.
-  function pointAtLeastMetersFromEnd(coordsLngLat, fromStart, minM) {
-    if (fromStart) {
-      var base = coordsLngLat[0];
-      for (var i = 1; i < coordsLngLat.length; i++) {
-        if (approxDistanceMeters(base, coordsLngLat[i]) >= minM) {
-          return coordsLngLat[i];
-        }
-      }
-      return coordsLngLat[coordsLngLat.length - 1];
-    }
-    var last = coordsLngLat[coordsLngLat.length - 1];
-    for (var j = coordsLngLat.length - 2; j >= 0; j--) {
-      if (approxDistanceMeters(last, coordsLngLat[j]) >= minM) {
-        return coordsLngLat[j];
-      }
-    }
-    return coordsLngLat[0];
+    if (startMarker) { startMarker.setOpacity(1); }
   }
 
   /**
-   * Drop ONE labelled "START/FINISH" marker on the loop.
+   * Drop ONE "START/FINISH" marker exactly on the loop's first point.
    *
    * Every route this app produces is a closed loop, so start and finish are
-   * essentially the same coordinate — a single combined label reads better
-   * than two flags fighting for the same pixel.
+   * the same coordinate. We use the route's own first point rather than the
+   * clicked start: OSRM snaps the start onto the nearest path, so the clicked
+   * point can sit off the line. The marker is a fixed pixel size anchored on
+   * the point, so it stays on the route at every zoom level.
    *
-   * To keep the label off the route line, we look at the two directions the
-   * route leaves the start point (outbound + inbound) and push the label the
-   * opposite way — into the open space on the outside of the loop.
+   * The user's start pin is hidden while the route is shown so there is only
+   * one marker to read; it reappears when a new start point is chosen.
    */
   function drawStartEndHighlights(coordsLngLat) {
     if (!Array.isArray(coordsLngLat) || coordsLngLat.length < 2) { return; }
     routeHighlightLayer = L.layerGroup().addTo(map);
 
     var start = coordsLngLat[0];
-
-    // Two directions the route emanates from the start: the first outbound
-    // segment, and the last inbound segment (taken as start → previous point).
-    var outAt  = pointAtLeastMetersFromEnd(coordsLngLat, true, 18);
-    var backAt = pointAtLeastMetersFromEnd(coordsLngLat, false, 18);
-    var dirOut  = segmentBearingDeg(start, outAt);
-    var dirBack = segmentBearingDeg(start, backAt);
-
-    // Unit vectors (east = sin(bearing), north = cos(bearing)). The sum points
-    // along the route's average heading; the label goes the opposite way.
-    var ox = Math.sin((dirOut * Math.PI) / 180);
-    var oy = Math.cos((dirOut * Math.PI) / 180);
-    var bx = Math.sin((dirBack * Math.PI) / 180);
-    var by = Math.cos((dirBack * Math.PI) / 180);
-    var sx = ox + bx;
-    var sy = oy + by;
-    var mag = Math.sqrt(sx * sx + sy * sy);
-
-    var awayX, awayY;
-    if (mag < 0.15) {
-      // Outbound and inbound nearly opposite (route passes straight through):
-      // there's no clear "outside", so step perpendicular to the route.
-      awayX = oy;
-      awayY = -ox;
-    } else {
-      awayX = -sx / mag;
-      awayY = -sy / mag;
-    }
-
-    // The orange start pin already sits on the exact point; the lime finish
-    // flag goes just outside the loop. The offset is in screen pixels (via the
-    // icon anchor) so the gap stays the same at every zoom level. The pin is
-    // drawn above its point, so a flag heading north needs a longer reach.
-    var reachPx = 44 + 22 * Math.max(0, awayY);
-    var flagIcon = L.divIcon({
-      className: FINISH_FLAG_ICON.options.className,
-      html: FINISH_FLAG_ICON.options.html,
-      iconSize: FINISH_FLAG_ICON.options.iconSize,
-      // Screen y grows downward, so north (awayY > 0) moves the icon up.
-      iconAnchor: [17 - awayX * reachPx, 17 + awayY * reachPx],
-    });
-
     L.marker([start[1], start[0]], {
-      interactive: false, keyboard: false, zIndexOffset: 1000,
-      icon: flagIcon,
+      interactive: false, keyboard: false, zIndexOffset: 1500,
+      icon: START_FINISH_ICON,
+      title: "Start / finish",
     }).addTo(routeHighlightLayer);
+
+    if (startMarker) { startMarker.setOpacity(0); }
   }
 
   /** Offset a [lng, lat] point perpendicular to a direction vector by `meters`. */
@@ -1140,12 +1087,10 @@
   /** Put the sidebar back to its empty "no route" state. */
   function resetRouteStats() {
     currentRoute = null;
+    cancelSignalCount();
     statDistance.textContent = "--";
-    statTime.textContent     = "--";
-    statPace.textContent     = "--";
-    statGain.textContent     = "--";
     statMaxClimb.textContent = "--";
-    statSignals.textContent  = "--";
+    setSignals("--", "junctions");
     elevGain.textContent     = "+0 m";
     renderElevationChart([], 0);
     setLive(false);
@@ -1158,17 +1103,65 @@
     var km = route.distance_meters / 1000;
 
     statDistance.textContent = km.toFixed(km >= 10 ? 1 : 2);
-    statTime.textContent     = String(Math.round((km * ASSUMED_PACE_SEC_PER_KM) / 60));
-    statPace.textContent     = formatMinSec(ASSUMED_PACE_SEC_PER_KM);
-    statGain.textContent     = formatElevationM(route.elevation_gain_m);
-    statMaxClimb.textContent = formatElevationM(route.max_climb_m);
-    statSignals.textContent  = String(route.signal_count);
+    statMaxClimb.textContent = String(Math.round(route.max_climb_m));
     elevGain.textContent     = "+" + formatElevationM(route.elevation_gain_m);
     renderElevationChart(route.elevation_profile, route.elevation_gain_m);
 
     setLive(true);
     setSaved(false);
     saveBtn.disabled = false;
+    loadSignalCount(route);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Traffic signals — fetched after the route is shown (see API_ROUTE_SIGNALS)
+  // ---------------------------------------------------------------------------
+
+  /** @type {AbortController|null} In-flight signal lookup, cancelled by a new route. */
+  var signalsAbort = null;
+
+  function setSignals(text, unit) {
+    statSignals.textContent = text;
+    signalsUnit.textContent = unit;
+  }
+
+  function cancelSignalCount() {
+    if (signalsAbort) { signalsAbort.abort(); signalsAbort = null; }
+  }
+
+  function loadSignalCount(route) {
+    cancelSignalCount();
+    var controller = new AbortController();
+    signalsAbort = controller;
+    setSignals("...", "counting");
+
+    fetch(API_ROUTE_SIGNALS, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      cache: "no-store",
+      body: JSON.stringify({ coordinates: route.coordinates }),
+      signal: controller.signal,
+    })
+      .then(function (res) {
+        if (!res.ok) { throw new Error("Signal lookup HTTP " + res.status); }
+        return res.json();
+      })
+      .then(function (data) {
+        if (signalsAbort !== controller) { return; }
+        var n = data.signal_count;
+        setSignals(String(n), n === 1 ? "junction" : "junctions");
+      })
+      .catch(function (err) {
+        if (err && err.name === "AbortError") { return; }
+        if (signalsAbort !== controller) { return; }
+        console.error(err);
+        // Unknown is not zero: say so instead of showing a misleading 0.
+        setSignals("--", "unavailable");
+        setStatus("Route ready. Traffic-signal data is unavailable right now (the OpenStreetMap service is busy). Try generating again later.");
+      })
+      .finally(function () {
+        if (signalsAbort === controller) { signalsAbort = null; }
+      });
   }
 
   // ---------------------------------------------------------------------------

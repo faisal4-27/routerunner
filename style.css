@@ -1064,24 +1064,6 @@ main {
   filter: drop-shadow(2px 2px 0 rgba(4, 17, 26, 0.9));
 }
 
-.finish-flag {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 34px;
-  height: 34px;
-  background: var(--lime);
-  border: 2px solid var(--bg-deep);
-  box-shadow: 3px 3px 0 var(--bg-deep);
-}
-
-.finish-flag svg {
-  width: 16px;
-  height: 16px;
-  fill: var(--bg-deep);
-  filter: none;
-}
-
 .direction-arrow-icon {
   background: transparent !important;
   border: none !important;
@@ -1205,38 +1187,6 @@ main {
   letter-spacing: 0.1em;
   text-transform: uppercase;
   color: var(--lime);
-}
-
-.mini-stats {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 0.5rem;
-  margin: 1rem 0 0;
-}
-
-.mini-stats > div {
-  min-width: 0;
-  padding: 0.5rem 0.55rem;
-  background: var(--panel-inset);
-  border: 1px solid var(--line-soft);
-}
-
-.mini-stats dt {
-  overflow: hidden;
-  font-size: 0.5625rem;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-  color: var(--dim);
-}
-
-.mini-stats dd {
-  margin: 0.3rem 0 0;
-  font-size: 0.8125rem;
-  font-weight: 600;
-  color: var(--cream);
-  font-variant-numeric: tabular-nums;
 }
 
 .elevation {
@@ -1425,23 +1375,17 @@ main {
     border-bottom: 1px solid var(--line-soft);
   }
 
-  .mini-stats {
-    grid-column: 2;
-    grid-row: 2;
-    margin-top: 1rem;
-  }
-
   .elevation {
     grid-column: 1;
-    grid-row: 2 / span 2;
+    grid-row: 2;
     margin: 1rem 0 0;
   }
 
   .save-btn {
     grid-column: 2;
-    grid-row: 3;
+    grid-row: 2;
     align-self: end;
-    margin-top: 0.75rem;
+    margin-top: 1rem;
   }
 }
 

@@ -283,43 +283,29 @@
                 </li>
                 <li class="stat-row">
                   <span class="stat-icon" aria-hidden="true">
+                    <!-- mountain with a peak notch -->
                     <svg viewBox="0 0 12 12" shape-rendering="crispEdges">
-                      <path d="M4 0h4v1h-4z M3 2h6v1h1v1h1v6h-1v1h-1v1h-6v-1h-1v-1h-1v-6h1v-1h1z M3 4v6h6v-6z" fill-rule="evenodd" />
-                      <path d="M5 5h1v2h2v1h-3z" />
+                      <path d="M7 2h1v1h1v2h1v2h1v2h1v2h-12v-2h1v-2h1v-1h1v-1h1v1h1v-2h1v-2h1z" />
                     </svg>
                   </span>
                   <div class="stat-text">
-                    <span class="stat-label">Est. time</span>
-                    <span class="stat-value"><span id="stat-time">--</span><span class="stat-unit">min</span></span>
+                    <span class="stat-label">Top climb</span>
+                    <span class="stat-value"><span id="stat-max-climb">--</span><span class="stat-unit">m</span></span>
                   </div>
                 </li>
                 <li class="stat-row">
                   <span class="stat-icon" aria-hidden="true">
+                    <!-- traffic light -->
                     <svg viewBox="0 0 12 12" shape-rendering="crispEdges">
-                      <path d="M6 0h2v2h-2z M4 3h4v1h2v1h-2v2h2v2h-1v3h-2v-3h-1v-1h-2v2h-2v-2h1v-1h2v-2h-1v1h-2v-1h1v-1h1z" />
+                      <path d="M3 0h6v10h-2v2h-2v-2h-2z M5 1v2h2v-2z M5 4v2h2v-2z M5 7v2h2v-2z" fill-rule="evenodd" />
                     </svg>
                   </span>
                   <div class="stat-text">
-                    <span class="stat-label" id="pace-label">Avg. pace</span>
-                    <span class="stat-value"><span id="stat-pace">--</span><span class="stat-unit">/km</span></span>
+                    <span class="stat-label">Traffic signals</span>
+                    <span class="stat-value"><span id="stat-signals">--</span><span class="stat-unit" id="signals-unit">junctions</span></span>
                   </div>
                 </li>
               </ul>
-
-              <dl class="mini-stats">
-                <div>
-                  <dt>Gain</dt>
-                  <dd id="stat-elevation-gain">--</dd>
-                </div>
-                <div>
-                  <dt>Top climb</dt>
-                  <dd id="stat-max-climb">--</dd>
-                </div>
-                <div>
-                  <dt>Signals</dt>
-                  <dd id="stat-signals">--</dd>
-                </div>
-              </dl>
 
               <div class="elevation">
                 <div class="elevation-head">
@@ -363,15 +349,21 @@
     <!--
       Backend URL configuration.
 
-      Local development (python run.py): leave this commented out. app.js will
-      default to http://<this-hostname>:8000.
+      Local development (python run.py): when the page is opened from
+      127.0.0.1 or localhost, nothing is set here and app.js defaults to
+      http://<this-hostname>:8000 (your local FastAPI backend).
 
-      Production: uncomment the line below and replace the URL with the origin
-      of your deployed FastAPI backend (Render, Fly.io, Railway, etc.). Make
+      Production: every other hostname uses the deployed backend below. Make
       sure that backend's CORS_ORIGINS env var lists this frontend's origin.
     -->
     <script>
-      window.ROUTERUNNER_API_BASE_URL = "https://routerunner-1.onrender.com";
+      (function () {
+        var host = window.location.hostname;
+        var isLocal = host === "127.0.0.1" || host === "localhost";
+        if (!isLocal) {
+          window.ROUTERUNNER_API_BASE_URL = "https://routerunner-1.onrender.com";
+        }
+      })();
     </script>
 
     <!--

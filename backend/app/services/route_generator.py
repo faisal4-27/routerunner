@@ -19,7 +19,9 @@ How it works:
    score — distance accuracy counts for 50 %, short U-turns 25 %, and
    double-backs 25 % — and keep the best. A perfectly in-tolerance, clean
    loop still wins outright and is returned as soon as the layouts resolve.
-6. Enrich the chosen route with traffic-signal and elevation data in parallel.
+6. Enrich the chosen route with elevation data. Traffic signals come from a
+   separate endpoint (POST /route-signals) so a slow Overpass can't delay
+   the route itself.
 """
 
 from __future__ import annotations
@@ -34,7 +36,6 @@ import httpx
 from app.models.schemas import RouteCandidate
 from app.services.elevation import fetch_elevations_along_route
 from app.services.osrm import OsrmError, fetch_osrm_route_through_points
-from app.services.overpass import count_traffic_signals
 from app.utils.geo import (
     LngLat,
     count_double_back_segments,
@@ -198,30 +199,20 @@ async def _enrich(
     distance_meters: float,
 ) -> RouteCandidate:
     """
-    Attach signal count and elevation stats to a finished route.
+    Attach elevation stats to a finished route.
 
-    Overpass (signals) and Open-Meteo (elevation) are independent third-party
-    calls, so we fire them in parallel. A flaky Overpass response just yields
-    a 0 signal count rather than killing the whole request.
+    Traffic signals are deliberately NOT looked up here: the public Overpass
+    server can take 30 s+ under load, and that shouldn't hold the route back.
+    The frontend asks POST /route-signals separately once the route is drawn.
     """
-
-    async def _signals() -> int:
-        try:
-            return await count_traffic_signals(client, coords)
-        except Exception:
-            return 0
-
-    signal_count, (gain_m, max_climb_m, profile_m) = await asyncio.gather(
-        _signals(),
-        fetch_elevations_along_route(client, coords),
-    )
+    gain_m, max_climb_m, profile_m = await fetch_elevations_along_route(client, coords)
 
     return RouteCandidate(
         coordinates=coords,
         distance_meters=distance_meters,
         elevation_gain_m=round(gain_m),
         max_climb_m=round(max_climb_m),
-        signal_count=signal_count,
+        signal_count=None,
         elevation_profile=[round(e, 1) for e in profile_m],
     )
 

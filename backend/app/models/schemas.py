@@ -6,7 +6,7 @@ These describe the JSON shape the frontend sends and receives.
 
 from __future__ import annotations
 
-from typing import List
+from typing import List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -37,7 +37,24 @@ class RouteCandidate(BaseModel):
     distance_meters: float
     elevation_gain_m: float
     max_climb_m: float
-    signal_count: int
+    # Filled in by POST /route-signals, not by /generate-route, so this is
+    # None here. Kept for response-shape compatibility.
+    signal_count: Optional[int] = None
     # Elevation samples (metres) evenly spaced along the loop, in route order.
     # Empty when elevation lookup failed; drives the frontend's chart.
     elevation_profile: List[float] = Field(default_factory=list)
+
+
+class RouteSignalsRequest(BaseModel):
+    """Body for POST /route-signals: the route line from /generate-route."""
+
+    coordinates: List[List[float]] = Field(
+        ..., min_length=2, max_length=20000,
+        description="GeoJSON LineString coordinates: [longitude, latitude] pairs",
+    )
+
+
+class RouteSignalsResponse(BaseModel):
+    """Signal-controlled intersections (nearby signal nodes grouped) along the route."""
+
+    signal_count: int

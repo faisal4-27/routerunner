@@ -1,16 +1,19 @@
 """
-Overpass API client — counts traffic signals near a route.
+Overpass API client — counts traffic-signal intersections along a route.
 
-The public overpass-api.de instance now requires a descriptive User-Agent and
+The public overpass-api.de instance requires a descriptive User-Agent and
 discourages parallel queries from one app. We send one request at a time and
-retry on temporary overload (429 / 504).
+retry while the server is overloaded (429 / 502 / 503 / 504) — under load it
+answers "502 ... server is currently at capacity", which must not be mistaken
+for "no signals".
 """
 
 from __future__ import annotations
 
 import asyncio
+import math
 import os
-from typing import List, Sequence
+from typing import List, Sequence, Tuple
 
 import httpx
 
@@ -23,79 +26,146 @@ OVERPASS_USER_AGENT = os.getenv(
     "RouteRunner/1.0 (local development; pedestrian route planner)",
 )
 
+# A signal counts when it is within this distance of the route line.
 SIGNAL_SEARCH_RADIUS_M = 35
-# Each sample point becomes an `around:` clause in the Overpass QL query;
-# 25 points covers a typical loop while keeping the query short enough
-# that Overpass responds in well under a second on a normal day.
-MAX_SAMPLE_POINTS = 25
+# Signals within this distance of each other are one intersection. OSM often
+# maps a junction as one node per approach (2–4 nodes for one set of lights),
+# and a runner only stops once per junction.
+INTERSECTION_CLUSTER_M = 30
+# The route line sent to Overpass. `around:` measures distance to the whole
+# polyline, so thinning only straightens corners slightly; 300 vertices keeps
+# the query short while staying within a few metres of the real path.
+MAX_LINE_VERTICES = 300
+# Small margin so signals just outside the route's bounding box still match.
+BBOX_PAD_DEG = 0.0005
+
+RETRY_STATUSES = {429, 502, 503, 504}
+MAX_ATTEMPTS = 4
 
 # Only one Overpass call at a time per server process (fair use policy).
 _overpass_lock = asyncio.Lock()
 
 
+class OverpassUnavailable(RuntimeError):
+    """Overpass could not answer, so the signal count is unknown (not zero)."""
+
+
 def build_overpass_signal_query(coords: Sequence[LngLat]) -> str:
-    """Build one Overpass QL query with an `around:` clause per sample point."""
-    samples = sample_line_coords(coords, MAX_SAMPLE_POINTS)
-    lines = []
-    for lng, lat in samples:
-        lines.append(
-            f'  node["highway"="traffic_signals"](around:{SIGNAL_SEARCH_RADIUS_M},{lat},{lng});'
-        )
-    return "[out:json][timeout:25];\n(\n" + "\n".join(lines) + "\n);\nout;"
+    """
+    Build one Overpass QL query for signal nodes near the whole route.
+
+    The bounding-box filter runs first and uses Overpass's spatial index, so
+    the comparatively expensive distance-to-polyline test only runs on the
+    handful of signals inside the route's area.
+    """
+    lats = [c[1] for c in coords]
+    lngs = [c[0] for c in coords]
+    bbox = (
+        f"{min(lats) - BBOX_PAD_DEG:.6f},{min(lngs) - BBOX_PAD_DEG:.6f},"
+        f"{max(lats) + BBOX_PAD_DEG:.6f},{max(lngs) + BBOX_PAD_DEG:.6f}"
+    )
+    line = ",".join(
+        f"{lat:.6f},{lng:.6f}" for lng, lat in sample_line_coords(coords, MAX_LINE_VERTICES)
+    )
+    return (
+        "[out:json][timeout:25];\n"
+        f'node["highway"="traffic_signals"]({bbox})->.signals;\n'
+        f"node.signals(around:{SIGNAL_SEARCH_RADIUS_M},{line});\n"
+        "out skel qt;"
+    )
+
+
+def _distance_m(a: Tuple[float, float], b: Tuple[float, float]) -> float:
+    """Equirectangular distance between (lat, lng) points; fine at this scale."""
+    mean_lat = math.radians((a[0] + b[0]) / 2)
+    dx = math.radians(b[1] - a[1]) * math.cos(mean_lat)
+    dy = math.radians(b[0] - a[0])
+    return 6371000.0 * math.hypot(dx, dy)
+
+
+def count_intersections(points: Sequence[Tuple[float, float]]) -> int:
+    """Group signal nodes closer than INTERSECTION_CLUSTER_M and count groups."""
+    parent = list(range(len(points)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i in range(len(points)):
+        for j in range(i + 1, len(points)):
+            if _distance_m(points[i], points[j]) <= INTERSECTION_CLUSTER_M:
+                parent[find(i)] = find(j)
+
+    return len({find(i) for i in range(len(points))})
 
 
 async def count_traffic_signals(
     client: httpx.AsyncClient, coords: Sequence[LngLat]
 ) -> int:
-    """Return the number of distinct traffic signal nodes near the route."""
+    """
+    Return the number of signal-controlled intersections along the route.
+
+    Raises OverpassUnavailable if Overpass can't answer — callers must not
+    report that as zero.
+    """
+    if len(coords) < 2:
+        return 0
     query = build_overpass_signal_query(coords)
 
     async with _overpass_lock:
-        return await _post_overpass_with_retry(client, query)
+        points = await _post_overpass_with_retry(client, query)
+    return count_intersections(points)
 
 
 async def _post_overpass_with_retry(
-    client: httpx.AsyncClient, query: str, max_attempts: int = 3
-) -> int:
-    """POST the query; retry after 429/504 with a short pause."""
-    last_error: Exception | None = None
+    client: httpx.AsyncClient, query: str
+) -> List[Tuple[float, float]]:
+    """POST the query, retrying with backoff while Overpass is overloaded."""
+    last_error = "no response"
 
-    for attempt in range(max_attempts):
+    for attempt in range(MAX_ATTEMPTS):
+        if attempt:
+            await asyncio.sleep(min(2 ** attempt, 10))
         try:
             response = await client.post(
                 OVERPASS_URL,
                 # Standard Overpass POST body (application/x-www-form-urlencoded).
                 data={"data": query},
                 headers={"User-Agent": OVERPASS_USER_AGENT},
-                timeout=60.0,
+                timeout=45.0,
+            )
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+            continue
+
+        if response.status_code in RETRY_STATUSES:
+            last_error = f"HTTP {response.status_code}"
+            if response.status_code == 429:
+                retry_after = response.headers.get("Retry-After", "")
+                if retry_after.isdigit():
+                    await asyncio.sleep(min(int(retry_after), 20))
+            continue
+
+        if response.status_code != 200:
+            raise OverpassUnavailable(
+                f"Overpass HTTP {response.status_code}: {(response.text or '')[:200]}"
             )
 
-            if response.status_code == 429:
-                wait_s = int(response.headers.get("Retry-After", "5"))
-                await asyncio.sleep(min(wait_s, 30))
-                continue
+        data = response.json()
+        # Overpass reports query-side timeouts in a 200 response via `remark`.
+        remark = data.get("remark") or ""
+        if "runtime error" in remark.lower():
+            last_error = remark[:200]
+            continue
 
-            if response.status_code == 504:
-                await asyncio.sleep(3 * (attempt + 1))
-                continue
+        return [
+            (float(el["lat"]), float(el["lon"]))
+            for el in data.get("elements", [])
+            if el.get("type") == "node" and "lat" in el and "lon" in el
+        ]
 
-            if response.status_code != 200:
-                body_preview = (response.text or "")[:200]
-                raise RuntimeError(
-                    f"Overpass HTTP {response.status_code}: {body_preview}"
-                )
-
-            data = response.json()
-            seen_ids: set[int] = set()
-            for element in data.get("elements", []):
-                if element.get("type") == "node" and element.get("id") is not None:
-                    seen_ids.add(int(element["id"]))
-            return len(seen_ids)
-
-        except (httpx.TimeoutException, httpx.TransportError) as exc:
-            last_error = exc
-            await asyncio.sleep(2 * (attempt + 1))
-
-    raise RuntimeError(
-        f"Overpass request failed after {max_attempts} attempts: {last_error}"
+    raise OverpassUnavailable(
+        f"Overpass unavailable after {MAX_ATTEMPTS} attempts ({last_error})"
     )
