@@ -84,15 +84,18 @@ async def fetch_elevations_batch(
 
 async def fetch_elevations_along_route(
     client: httpx.AsyncClient, coords: Sequence[LngLat]
-) -> Tuple[float, float]:
+) -> Tuple[float, float, List[float]]:
     """
-    Sample the route and return (total_gain_m, max_climb_m).
+    Sample the route and return (total_gain_m, max_climb_m, profile).
+
+    `profile` is the sampled elevation series in route order, used by the
+    frontend's elevation chart.
 
     Batches are fired concurrently — Open-Meteo handles independent requests
     in parallel, and with the 96-sample cap a typical loop now needs only
     one batch (single round-trip).
 
-    Returns (0, 0) if the API returns too few usable points.
+    Returns (0, 0, []) if the API returns too few usable points.
     """
     sampled = sample_line_coords(coords, ELEVATION_MAX_SAMPLES)
 
@@ -109,5 +112,6 @@ async def fetch_elevations_along_route(
         all_elev.extend(batch_elev)
 
     if len(all_elev) < 2:
-        return 0.0, 0.0
-    return elevation_stats(all_elev)
+        return 0.0, 0.0, []
+    gain, max_climb = elevation_stats(all_elev)
+    return gain, max_climb, all_elev

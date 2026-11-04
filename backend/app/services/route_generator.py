@@ -211,7 +211,7 @@ async def _enrich(
         except Exception:
             return 0
 
-    signal_count, (gain_m, max_climb_m) = await asyncio.gather(
+    signal_count, (gain_m, max_climb_m, profile_m) = await asyncio.gather(
         _signals(),
         fetch_elevations_along_route(client, coords),
     )
@@ -222,6 +222,7 @@ async def _enrich(
         elevation_gain_m=round(gain_m),
         max_climb_m=round(max_climb_m),
         signal_count=signal_count,
+        elevation_profile=[round(e, 1) for e in profile_m],
     )
 
 

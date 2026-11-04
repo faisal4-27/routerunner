@@ -8,9 +8,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 
     <title>Route Runner</title>
+    <meta name="theme-color" content="#071721" />
 
     <link rel="preconnect" href="https://unpkg.com" crossorigin="" />
-    <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin="" />
     <link rel="preconnect" href="https://tile.openstreetmap.org" crossorigin="" />
 
     <!--
@@ -24,113 +24,341 @@
       crossorigin=""
     />
 
+    <!-- Press Start 2P: pixel display type. IBM Plex Mono: legible UI text. -->
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="" />
     <link
       rel="stylesheet"
-      href="https://fonts.googleapis.com/css2?family=Homenaje&display=swap"
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Press+Start+2P&display=swap"
     />
 
     <!-- Your app’s layout and colors -->
     <link rel="stylesheet" href="style.css" />
   </head>
   <body>
-    <main class="page-shell">
-      <header class="intro">
-        <h1 class="app-title">Route Runner</h1>
+    <div class="page-shell">
+      <!-- ================================================================
+           HEADER
+           ================================================================ -->
+      <header class="topbar">
+        <a class="logo" href="./" aria-label="Route Runner home">
+          <svg class="logo-mark" viewBox="0 0 7 7" aria-hidden="true" shape-rendering="crispEdges">
+            <rect x="0" y="0" width="2" height="2" fill="#b7f34a" />
+            <rect x="5" y="0" width="2" height="2" fill="#b7f34a" />
+            <rect x="2" y="2" width="3" height="3" fill="#ff5c35" />
+            <rect x="0" y="5" width="2" height="2" fill="#b7f34a" />
+            <rect x="5" y="5" width="2" height="2" fill="#b7f34a" />
+          </svg>
+          <span class="logo-word"><span class="logo-route">Route</span><span class="logo-runner">Runner</span></span>
+        </a>
+
+        <!-- Reflects the browser geolocation state; updated by app.js. -->
+        <div class="gps-status" id="gps-status" data-state="idle" role="status">
+          <span class="status-light" aria-hidden="true"></span>
+          <span id="gps-status-text">GPS standby</span>
+          <svg class="signal-bars" viewBox="0 0 13 9" aria-hidden="true" shape-rendering="crispEdges">
+            <rect x="0" y="6" width="2" height="3" />
+            <rect x="3" y="4" width="2" height="5" />
+            <rect x="6" y="2" width="2" height="7" />
+            <rect x="9" y="0" width="2" height="9" />
+          </svg>
+        </div>
       </header>
 
-      <section class="map-frame" role="region" aria-label="Route options and map">
-        <div class="control-panel">
-          <p class="hint">
-            Search for a location below, or click anywhere on the map, to choose
-            your start point.
-          </p>
-
-          <div class="field search-field" id="location-search-field">
-            <label for="location-search">Start location</label>
-            <div class="search-row">
-              <input
-                id="location-search"
-                type="search"
-                class="search-input"
-                placeholder="Address, street, or city"
-                autocomplete="off"
-              />
-              <button type="button" id="location-search-btn" class="search-btn">
-                Search
-              </button>
-            </div>
-            <!-- Filled by app.js with the matches for the typed query -->
-            <ul id="location-results" class="search-results" hidden></ul>
+      <main>
+        <!-- ==============================================================
+             HERO
+             ============================================================== -->
+        <section class="hero" aria-labelledby="hero-title">
+          <div class="hero-copy">
+            <p class="eyebrow">/// Loop route generator</p>
+            <h1 class="hero-title" id="hero-title">
+              <span class="hero-line">Your run.</span>
+              <span class="hero-line hero-line-accent">Your route.</span>
+            </h1>
+            <p class="hero-sub">
+              Drop a start point. Set the distance.<br />
+              We’ll build the loop.
+            </p>
           </div>
 
-          <div class="field">
-            <label for="distance-slider">
-              Target distance:
-              <span id="distance-value" class="distance-readout">5 km</span>
-            </label>
-            <div class="distance-controls">
-              <input
-                id="distance-slider"
-                type="range"
-                min="1"
-                max="42"
-                step="0.5"
-                value="5"
-              />
-              <input
-                id="distance-input"
-                type="number"
-                inputmode="decimal"
-                min="1"
-                max="42"
-                step="0.1"
-                value="5"
-                class="distance-input"
-                aria-label="Target distance in kilometres"
-              />
-              <span class="distance-unit" aria-hidden="true">km</span>
+          <!-- Generated from a 32×24 pixel grid; crispEdges keeps it sharp at any scale. -->
+          <svg class="hero-runner" viewBox="0 0 32 24" aria-hidden="true" shape-rendering="crispEdges">
+            <g class="runner-speed">
+              <rect x="8" y="5" width="6" height="1" fill="#4fb3d9" />
+              <rect x="4" y="7" width="8" height="1" fill="#4fb3d9" />
+              <rect x="6" y="11" width="5" height="1" fill="#4fb3d9" />
+            </g>
+            <g class="runner-ground">
+              <rect x="9" y="22" width="18" height="1" fill="#1b3244" />
+              <rect x="7" y="23" width="22" height="1" fill="#10222f" />
+            </g>
+            <g class="runner-body">
+              <rect x="19" y="1" width="4" height="1" fill="#f4ead2" />
+              <rect x="18" y="2" width="6" height="2" fill="#f4ead2" />
+              <rect x="19" y="4" width="4" height="1" fill="#f4ead2" />
+              <rect x="18" y="5" width="6" height="1" fill="#ff5c35" />
+              <rect x="18" y="6" width="7" height="1" fill="#ff5c35" />
+              <rect x="28" y="6" width="2" height="1" fill="#f4ead2" />
+              <rect x="17" y="7" width="8" height="2" fill="#ff5c35" />
+              <rect x="27" y="7" width="2" height="1" fill="#f4ead2" />
+              <rect x="13" y="8" width="2" height="1" fill="#f4ead2" />
+              <rect x="25" y="8" width="3" height="1" fill="#f4ead2" />
+              <rect x="12" y="9" width="4" height="1" fill="#f4ead2" />
+              <rect x="16" y="9" width="8" height="1" fill="#ff5c35" />
+              <rect x="11" y="10" width="2" height="1" fill="#f4ead2" />
+              <rect x="16" y="10" width="1" height="1" fill="#c8401f" />
+              <rect x="17" y="10" width="6" height="1" fill="#ff5c35" />
+              <rect x="16" y="11" width="2" height="1" fill="#c8401f" />
+              <rect x="18" y="11" width="4" height="1" fill="#ff5c35" />
+              <rect x="15" y="12" width="6" height="1" fill="#2b4a63" />
+              <rect x="14" y="13" width="8" height="1" fill="#2b4a63" />
+              <rect x="13" y="14" width="3" height="1" fill="#2b4a63" />
+              <rect x="20" y="14" width="4" height="1" fill="#2b4a63" />
+              <rect x="11" y="15" width="3" height="1" fill="#f4ead2" />
+              <rect x="21" y="15" width="4" height="1" fill="#f4ead2" />
+              <rect x="9" y="16" width="3" height="1" fill="#f4ead2" />
+              <rect x="23" y="16" width="3" height="1" fill="#f4ead2" />
+              <rect x="8" y="17" width="2" height="1" fill="#f4ead2" />
+              <rect x="24" y="17" width="2" height="1" fill="#f4ead2" />
+              <rect x="6" y="18" width="2" height="2" fill="#b7f34a" />
+              <rect x="8" y="18" width="1" height="1" fill="#f4ead2" />
+              <rect x="23" y="18" width="2" height="2" fill="#f4ead2" />
+              <rect x="25" y="19" width="3" height="1" fill="#b7f34a" />
+              <rect x="23" y="20" width="5" height="1" fill="#b7f34a" />
+            </g>
+          </svg>
+        </section>
+
+        <!-- ==============================================================
+             ROUTE PLANNER
+             ============================================================== -->
+        <section class="panel planner" aria-labelledby="planner-title">
+          <h2 class="sr-only" id="planner-title">Route planner</h2>
+
+          <div class="planner-grid">
+            <div class="field field-location" id="location-search-field">
+              <label class="field-label" for="location-search">
+                <span class="step">01</span> Start location
+              </label>
+              <div class="input-shell">
+                <svg class="input-icon" viewBox="0 0 10 12" aria-hidden="true" shape-rendering="crispEdges">
+                  <path d="M3 0h4v1h1v1h1v4h-1v2h-1v2h-1v2h-2v-2h-1v-2h-1v-2h-1v-4h1v-1h1z M4 3v2h2v-2z" fill-rule="evenodd" />
+                </svg>
+                <input
+                  id="location-search"
+                  type="search"
+                  class="search-input"
+                  placeholder="Address, street, or city"
+                  autocomplete="off"
+                  spellcheck="false"
+                  aria-describedby="status-msg"
+                />
+                <button
+                  type="button"
+                  id="locate-btn"
+                  class="icon-btn locate-btn"
+                  aria-label="Use my current location"
+                  title="Use my current location"
+                >
+                  <svg viewBox="0 0 16 16" aria-hidden="true" shape-rendering="crispEdges">
+                    <path d="M7 0h2v3h-2z M7 13h2v3h-2z M0 7h3v2h-3z M13 7h3v2h-3z" />
+                    <path d="M5 3h6v1h1v1h1v6h-1v1h-1v1h-6v-1h-1v-1h-1v-6h1v-1h1z M5 5v6h6v-6z" fill-rule="evenodd" />
+                    <rect x="7" y="7" width="2" height="2" />
+                  </svg>
+                </button>
+              </div>
+              <!-- Filled by app.js with the matches for the typed query -->
+              <ul id="location-results" class="search-results" hidden></ul>
             </div>
-          </div>
 
-          <button type="button" id="generate-btn" class="primary-btn">
-            Generate route
-          </button>
+            <div class="field field-distance">
+              <label class="field-label" for="distance-slider">
+                <span class="step">02</span> Target distance
+              </label>
+              <div class="distance-controls">
+                <div class="slider-wrap">
+                  <input
+                    id="distance-slider"
+                    class="range"
+                    type="range"
+                    min="1"
+                    max="42"
+                    step="0.5"
+                    value="5"
+                  />
+                  <div class="range-scale" aria-hidden="true">
+                    <span id="range-min-label">1 km</span>
+                    <span id="range-max-label">42 km</span>
+                  </div>
+                </div>
+                <div class="km-box">
+                  <input
+                    id="distance-input"
+                    type="number"
+                    inputmode="decimal"
+                    min="1"
+                    max="42"
+                    step="0.1"
+                    value="5"
+                    class="distance-input"
+                    aria-label="Target distance in kilometres"
+                  />
+                  <span class="km-unit" aria-hidden="true">km</span>
+                </div>
+              </div>
+            </div>
 
-          <!-- Filled by app.js after each successful route (aria-live helps screen readers) -->
-          <div id="route-stats" class="route-stats" hidden aria-live="polite">
-            <h2 class="stats-heading">Route summary</h2>
-            <ul class="stats-list">
-              <li>Total distance: <strong id="stat-distance">—</strong></li>
-              <li>Elevation gain: <strong id="stat-elevation-gain">—</strong></li>
-              <li>Biggest climb: <strong id="stat-max-climb">—</strong></li>
-              <li>Traffic signals (approx.): <strong id="stat-signals">—</strong></li>
-            </ul>
+            <button type="button" id="generate-btn" class="generate-btn">
+              <svg class="btn-icon" viewBox="0 0 12 12" aria-hidden="true" shape-rendering="crispEdges">
+                <path d="M1 0h2v12h-2z M3 1h7v1h1v4h-1v1h-7z" />
+              </svg>
+              <span class="generate-label" id="generate-label">Generate route</span>
+              <svg class="btn-arrow" viewBox="0 0 14 10" aria-hidden="true" shape-rendering="crispEdges">
+                <path d="M0 4h10v2h-10z M8 1h2v1h1v1h1v1h1v2h-1v1h-1v1h-1v1h-2v-1h1v-1h1v-1h1v-2h-1v-1h-1v-1h-1z" />
+              </svg>
+            </button>
           </div>
 
           <p id="status-msg" class="status-msg" role="status"></p>
-        </div>
+        </section>
 
-        <div class="map-wrap">
-          <div id="map" aria-label="Interactive map"></div>
-          <div id="map-loading" class="map-loading" role="status" aria-label="Generating route" hidden>
-            <div class="spinner"></div>
-            <span id="map-loading-text" class="map-loading-text">Generating route…</span>
+        <!-- ==============================================================
+             DASHBOARD: map + route data
+             ============================================================== -->
+        <section class="dashboard" aria-label="Generated route">
+          <div class="panel map-panel">
+            <div class="panel-head">
+              <span class="step">03</span>
+              <div class="panel-head-text">
+                <p class="micro-label">Generated loop</p>
+                <p class="map-place" id="map-place">Set a start point</p>
+              </div>
+              <span class="route-id" id="route-id">Route_--</span>
+            </div>
+
+            <div class="map-wrap">
+              <div
+                id="map"
+                role="application"
+                aria-label="Interactive map. Click to set the start point."
+              ></div>
+
+              <div id="map-loading" class="map-loading" role="status" hidden>
+                <span class="spinner" aria-hidden="true"></span>
+                <span id="map-loading-text" class="map-loading-text">Generating route…</span>
+              </div>
+
+              <div class="map-badge map-badge-status" id="route-badge" data-state="idle">
+                <span class="status-light" aria-hidden="true"></span>
+                <span id="route-badge-text">Awaiting route</span>
+              </div>
+              <div class="map-badge map-badge-coords" id="map-coords" aria-label="Start point coordinates">
+                <span id="coord-lat">--.----° N</span>
+                <span id="coord-lng">--.----° W</span>
+              </div>
+            </div>
           </div>
-        </div>
-        <p class="project-blurb">
-          Route Runner generates looped running routes from a chosen start point
-          and target distance. The backend places waypoints around a virtual
-          circle, repeatedly asks OSRM for foot routes to tune distance accuracy,
-          and scores candidate loops to prefer routes that stay close to the
-          requested distance while reducing short U-turns and double-backs. The
-          stack uses Leaflet and vanilla JavaScript on the frontend with a FastAPI
-          + Python backend, plus OSRM routing, Photon location search, Overpass
-          traffic-signal lookups, and Open-Meteo elevation sampling.
-        </p>
-      </section>
-    </main>
+
+          <aside class="panel data-panel" aria-labelledby="data-title">
+            <div class="data-head">
+              <span class="status-light" id="data-light" aria-hidden="true"></span>
+              <h2 class="data-title" id="data-title">Route data</h2>
+              <span class="live-badge" id="live-badge" data-state="idle">Idle</span>
+            </div>
+
+            <!-- Filled by app.js after each successful route (aria-live helps screen readers) -->
+            <div class="data-body" id="route-stats" aria-live="polite">
+              <ul class="stat-list">
+                <li class="stat-row">
+                  <span class="stat-icon" aria-hidden="true">
+                    <svg viewBox="0 0 12 12" shape-rendering="crispEdges">
+                      <path d="M0 9h3v-6h3v6h3v-6h3v2h-1v-1h-1v6h-5v-6h-1v6h-4z" />
+                    </svg>
+                  </span>
+                  <div class="stat-text">
+                    <span class="stat-label">Distance</span>
+                    <span class="stat-value"><span id="stat-distance">--</span><span class="stat-unit">km</span></span>
+                  </div>
+                </li>
+                <li class="stat-row">
+                  <span class="stat-icon" aria-hidden="true">
+                    <svg viewBox="0 0 12 12" shape-rendering="crispEdges">
+                      <path d="M4 0h4v1h-4z M3 2h6v1h1v1h1v6h-1v1h-1v1h-6v-1h-1v-1h-1v-6h1v-1h1z M3 4v6h6v-6z" fill-rule="evenodd" />
+                      <path d="M5 5h1v2h2v1h-3z" />
+                    </svg>
+                  </span>
+                  <div class="stat-text">
+                    <span class="stat-label">Est. time</span>
+                    <span class="stat-value"><span id="stat-time">--</span><span class="stat-unit">min</span></span>
+                  </div>
+                </li>
+                <li class="stat-row">
+                  <span class="stat-icon" aria-hidden="true">
+                    <svg viewBox="0 0 12 12" shape-rendering="crispEdges">
+                      <path d="M6 0h2v2h-2z M4 3h4v1h2v1h-2v2h2v2h-1v3h-2v-3h-1v-1h-2v2h-2v-2h1v-1h2v-2h-1v1h-2v-1h1v-1h1z" />
+                    </svg>
+                  </span>
+                  <div class="stat-text">
+                    <span class="stat-label" id="pace-label">Avg. pace</span>
+                    <span class="stat-value"><span id="stat-pace">--</span><span class="stat-unit">/km</span></span>
+                  </div>
+                </li>
+              </ul>
+
+              <dl class="mini-stats">
+                <div>
+                  <dt>Gain</dt>
+                  <dd id="stat-elevation-gain">--</dd>
+                </div>
+                <div>
+                  <dt>Top climb</dt>
+                  <dd id="stat-max-climb">--</dd>
+                </div>
+                <div>
+                  <dt>Signals</dt>
+                  <dd id="stat-signals">--</dd>
+                </div>
+              </dl>
+
+              <div class="elevation">
+                <div class="elevation-head">
+                  <span class="micro-label">Elevation</span>
+                  <span class="elevation-gain" id="elev-gain">+0 m</span>
+                </div>
+                <svg
+                  class="elevation-chart"
+                  id="elev-chart"
+                  viewBox="0 0 120 40"
+                  preserveAspectRatio="none"
+                  shape-rendering="crispEdges"
+                  role="img"
+                  aria-label="Elevation profile: no route yet"
+                ></svg>
+                <p class="elevation-range" id="elev-range" aria-hidden="true">
+                  <span id="elev-min">-- m</span><span id="elev-max">-- m</span>
+                </p>
+              </div>
+
+              <button type="button" id="save-btn" class="save-btn" disabled>
+                <span id="save-label">Save route</span>
+                <svg class="btn-icon" id="save-icon" viewBox="0 0 10 10" aria-hidden="true" shape-rendering="crispEdges">
+                  <path d="M4 0h2v5h1v-1h1v-1h1v2h-1v1h-1v1h-1v1h-2v-1h-1v-1h-1v-1h-1v-2h1v1h1v1h1z M0 9h10v1h-10z" />
+                </svg>
+              </button>
+            </div>
+          </aside>
+        </section>
+      </main>
+
+      <!-- ================================================================
+           FOOTER
+           ================================================================ -->
+      <footer class="footer">
+        <p><span class="footer-strong">Route Runner</span> / Built for the long way round</p>
+        <p>OSRM + OpenStreetMap <span class="footer-version">SYS.V2.0.0</span></p>
+      </footer>
+    </div>
 
     <!--
       Backend URL configuration.

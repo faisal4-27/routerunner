@@ -66,20 +66,46 @@
       '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
   }).addTo(map);
 
+  // Pixel-art markers. crispEdges keeps the blocks sharp at any zoom.
+  var START_PIN_ICON = L.divIcon({
+    className: "rr-marker rr-start",
+    html:
+      '<svg width="30" height="36" viewBox="0 0 10 12" shape-rendering="crispEdges" aria-hidden="true">' +
+        '<path d="M3 0h4v1h1v1h1v4h-1v2h-1v2h-1v2h-2v-2h-1v-2h-1v-2h-1v-4h1v-1h1z" fill="#04111a"/>' +
+        '<path d="M3 1h4v1h1v4h-1v2h-1v2h-2v-2h-1v-2h-1v-4h1z" fill="#ff5c35"/>' +
+        '<path d="M4 3h2v2h-2z" fill="#f4ead2"/>' +
+      "</svg>",
+    iconSize: [30, 36],
+    iconAnchor: [15, 36],
+  });
+
+  var FINISH_FLAG_ICON = L.divIcon({
+    className: "rr-marker rr-finish",
+    html:
+      '<div class="finish-flag">' +
+        '<svg viewBox="0 0 12 12" shape-rendering="crispEdges" aria-hidden="true">' +
+          '<path d="M1 0h2v12h-2z M3 1h7v1h1v4h-1v1h-7z"/>' +
+        "</svg>" +
+      "</div>",
+    iconSize: [34, 34],
+    iconAnchor: [17, 17],
+  });
+
   // ---------------------------------------------------------------------------
   // UI element references
   // ---------------------------------------------------------------------------
 
   var slider          = document.getElementById("distance-slider");
   var distanceInput   = document.getElementById("distance-input");
-  var distanceReadout = document.getElementById("distance-value");
   var generateBtn     = document.getElementById("generate-btn");
+  var generateLabel   = document.getElementById("generate-label");
 
   // Slider bounds are the source of truth for what the backend accepts.
   var DISTANCE_MIN_KM = parseFloat(slider.min);
   var DISTANCE_MAX_KM = parseFloat(slider.max);
-  var routeStatsEl    = document.getElementById("route-stats");
   var statDistance    = document.getElementById("stat-distance");
+  var statTime        = document.getElementById("stat-time");
+  var statPace        = document.getElementById("stat-pace");
   var statGain        = document.getElementById("stat-elevation-gain");
   var statMaxClimb    = document.getElementById("stat-max-climb");
   var statSignals     = document.getElementById("stat-signals");
@@ -88,8 +114,40 @@
   var mapLoadingText  = document.getElementById("map-loading-text");
   var searchField     = document.getElementById("location-search-field");
   var searchInput     = document.getElementById("location-search");
-  var searchBtn       = document.getElementById("location-search-btn");
+  var locateBtn       = document.getElementById("locate-btn");
   var searchResults   = document.getElementById("location-results");
+
+  // Dashboard chrome
+  var gpsStatus       = document.getElementById("gps-status");
+  var gpsStatusText   = document.getElementById("gps-status-text");
+  var mapPlace        = document.getElementById("map-place");
+  var routeIdEl       = document.getElementById("route-id");
+  var routeBadge      = document.getElementById("route-badge");
+  var routeBadgeText  = document.getElementById("route-badge-text");
+  var coordLat        = document.getElementById("coord-lat");
+  var coordLng        = document.getElementById("coord-lng");
+  var liveBadge       = document.getElementById("live-badge");
+  var dataLight       = document.getElementById("data-light");
+  var elevChart       = document.getElementById("elev-chart");
+  var elevGain        = document.getElementById("elev-gain");
+  var elevMin         = document.getElementById("elev-min");
+  var elevMax         = document.getElementById("elev-max");
+  var saveBtn         = document.getElementById("save-btn");
+  var saveLabel       = document.getElementById("save-label");
+
+  document.getElementById("range-min-label").textContent = formatKm(DISTANCE_MIN_KM);
+  document.getElementById("range-max-label").textContent = formatKm(DISTANCE_MAX_KM);
+
+  // The backend doesn't know the runner's speed, so time is estimated from a
+  // steady recreational pace. Change this one number to retune the estimate.
+  var ASSUMED_PACE_SEC_PER_KM = 6 * 60;
+
+  // Palette shared with style.css (Leaflet paths take colours, not classes).
+  var COLOR_ORANGE = "#ff5c35";
+  var COLOR_CREAM  = "#f4ead2";
+  var COLOR_LIME   = "#b7f34a";
+  var COLOR_CYAN   = "#4fb3d9";
+  var COLOR_DEEP   = "#04111a";
 
   // ---------------------------------------------------------------------------
   // Mutable state
@@ -107,6 +165,13 @@
   /** @type {L.LayerGroup|null} */    var routeOverlapLayer   = null;
   /** @type {L.LayerGroup|null} */    var routeHighlightLayer = null;
 
+  /** @type {Object|null} Last successful /generate-route response (for saving). */
+  var currentRoute = null;
+  /** Counts routes generated this session, shown as ROUTE_01, ROUTE_02… */
+  var routeCounter = 0;
+  /** Human label for the start point, shown in the map header. */
+  var startLabel = "";
+
   // ---------------------------------------------------------------------------
   // Start-point helpers
   // ---------------------------------------------------------------------------
@@ -120,16 +185,28 @@
    *     in (fitBounds caps the zoom at USER_LOCATION_ZOOM).
    *   - { zoom: n } jumps to the point at a fixed zoom.
    *   - omitted leaves the current view exactly where it is.
+   *
+   * `label` names the point in the map header ("Waterloo, Ontario").
    */
-  function setStartPoint(lat, lng, view) {
+  function setStartPoint(lat, lng, view, label) {
     var ll = L.latLng(lat, lng);
     startPoint = { lat: ll.lat, lng: ll.lng };
 
     if (!startMarker) {
-      startMarker = L.marker(ll).addTo(map);
+      startMarker = L.marker(ll, {
+        icon: START_PIN_ICON,
+        keyboard: false,
+        zIndexOffset: 1200,
+        title: "Start point",
+      }).addTo(map);
     } else {
       startMarker.setLatLng(ll);
     }
+
+    startLabel = label || "Custom start point";
+    mapPlace.textContent = startLabel;
+    coordLat.textContent = formatCoord(ll.lat, "N", "S");
+    coordLng.textContent = formatCoord(ll.lng, "E", "W");
 
     if (view && view.bounds) {
       map.fitBounds(view.bounds, { padding: [24, 24], maxZoom: USER_LOCATION_ZOOM });
@@ -157,24 +234,63 @@
   //   approximate location to that third party, though never to us. Because
   //   suggestions update while typing, this happens once per burst of
   //   keystrokes rather than only on submit.
-  function initializeUserLocation() {
+  // - The "use my location" button repeats the same one-shot request, but
+  //   only when the user presses it.
+  function setGpsState(state, text) {
+    gpsStatus.dataset.state = state;
+    gpsStatusText.textContent = text;
+  }
+
+  /**
+   * Ask the browser for the user's position once.
+   *
+   * `explicit` is true when the user pressed the locate button: their fresh
+   * position then always wins, and failures are reported as errors. On page
+   * load it stays quiet and never overrides a start point the user already
+   * chose while the permission prompt was open.
+   */
+  function locateUser(explicit) {
     if (!navigator.geolocation) {
+      setGpsState("error", "GPS unavailable");
+      locateBtn.disabled = true;
       setStatus("Search for a location, or click the map, to set your start point.");
       return;
     }
 
+    setGpsState("busy", "GPS searching");
+    locateBtn.disabled = true;
+    locateBtn.classList.add("is-busy");
     setStatus("Finding your location…");
+
+    function done() {
+      locateBtn.disabled = false;
+      locateBtn.classList.remove("is-busy");
+    }
+
     navigator.geolocation.getCurrentPosition(
       function (pos) {
+        done();
+        setGpsState("active", "GPS active");
         // The permission prompt can sit open for a while. If the user already
         // searched or clicked a start point in the meantime, leave it alone.
-        if (startPoint) { return; }
-        setStartPoint(pos.coords.latitude, pos.coords.longitude, { zoom: USER_LOCATION_ZOOM });
+        if (startPoint && !explicit) { return; }
+        clearSearchResults();
+        searchInput.value = "";
+        setStartPoint(
+          pos.coords.latitude, pos.coords.longitude,
+          { zoom: USER_LOCATION_ZOOM }, "Your location"
+        );
         setStatus("Start point set to your location. Click anywhere to move it.");
       },
       function () {
+        done();
+        setGpsState("idle", "GPS offline");
         // Permission denied or timed out — fall back gracefully without
         // alarming the user about it. Search is the way out of this state.
+        if (explicit) {
+          setStatus("Couldn't get your location. Check location permissions, or search for a place.", true);
+          return;
+        }
         if (startPoint) { return; }
         setStatus("Couldn't get your location — search for a place, or click the map.");
       },
@@ -364,7 +480,8 @@
     setStartPoint(
       result.lat,
       result.lng,
-      result.bounds ? { bounds: result.bounds } : { zoom: USER_LOCATION_ZOOM }
+      result.bounds ? { bounds: result.bounds } : { zoom: USER_LOCATION_ZOOM },
+      result.label
     );
     setStatus("Start point set to " + result.primary + ". Click the map to fine-tune it.");
   }
@@ -434,6 +551,22 @@
     return Math.round(m) + " m";
   }
 
+  function formatCoord(value, positive, negative) {
+    return Math.abs(value).toFixed(4) + "° " + (value >= 0 ? positive : negative);
+  }
+
+  /** Seconds → "m:ss" (pace) */
+  function formatMinSec(totalSec) {
+    var s = Math.round(totalSec);
+    var m = Math.floor(s / 60);
+    var r = s % 60;
+    return m + ":" + (r < 10 ? "0" : "") + r;
+  }
+
+  function pad2(n) {
+    return (n < 10 ? "0" : "") + n;
+  }
+
   // Parse the input box. Returns the numeric distance in km, or null if the
   // text isn't a usable positive number inside the allowed range. Treat
   // whitespace-only strings the same as empty.
@@ -446,17 +579,32 @@
     return n;
   }
 
-  // Refresh the readable "X km" label and the red-border invalid state.
+  // Refresh the slider's orange progress fill and the red invalid state.
   // Always uses the input box (the user-typed value) as the source of truth.
   function syncDistanceLabel() {
     var parsed = parseDistanceInput();
-    if (parsed === null) {
-      distanceReadout.textContent = "— km";
-      distanceInput.classList.add("invalid");
-    } else {
-      distanceReadout.textContent = formatKm(parsed);
-      distanceInput.classList.remove("invalid");
+    distanceInput.classList.toggle("invalid", parsed === null);
+    distanceInput.setAttribute("aria-invalid", parsed === null ? "true" : "false");
+
+    var v = parseFloat(slider.value);
+    var pct = ((v - DISTANCE_MIN_KM) / (DISTANCE_MAX_KM - DISTANCE_MIN_KM)) * 100;
+    slider.style.setProperty("--fill", pct + "%");
+  }
+
+  // When the user leaves the box, snap any out-of-range number to the nearest
+  // supported distance. Non-numbers are left alone so the invalid state (and
+  // the error on Generate) can tell the user what's wrong.
+  function clampDistanceInput() {
+    var n = Number((distanceInput.value || "").trim());
+    if ((distanceInput.value || "").trim() === "" || !isFinite(n)) { return; }
+    var clamped = Math.min(DISTANCE_MAX_KM, Math.max(DISTANCE_MIN_KM, n));
+    if (clamped !== n) {
+      distanceInput.value = String(clamped);
+      setStatus("Distance adjusted to " + formatKm(clamped) + " (supported range " +
+        formatKm(DISTANCE_MIN_KM) + "–" + formatKm(DISTANCE_MAX_KM) + ").");
     }
+    slider.value = String(clamped);
+    syncDistanceLabel();
   }
 
   function setStatus(text, isError) {
@@ -464,9 +612,22 @@
     statusMsg.classList.toggle("error", Boolean(isError));
   }
 
+  function setRouteBadge(state, text) {
+    routeBadge.dataset.state = state;
+    routeBadgeText.textContent = text;
+  }
+
   function setLoading(active) {
-    if (!mapLoading) { return; }
-    mapLoading.hidden = !active;
+    if (mapLoading) { mapLoading.hidden = !active; }
+    generateBtn.disabled = active;
+    generateBtn.classList.toggle("is-loading", active);
+    generateBtn.setAttribute("aria-busy", active ? "true" : "false");
+    generateLabel.textContent = active ? "Plotting..." : "Generate route";
+    if (active) {
+      setRouteBadge("busy", "Plotting route");
+      liveBadge.dataset.state = "busy";
+      liveBadge.textContent = "Calc";
+    }
   }
 
   function setMapLoadingText(text) {
@@ -551,20 +712,14 @@
 
     var searchCircle = L.circle([start.lat, start.lng], {
       radius: radiusM,
-      color: "#fc4c02", weight: 1.5, opacity: 0.5,
-      fillColor: "#fc4c02", fillOpacity: 0.05,
-      dashArray: "5 6", interactive: false,
+      color: COLOR_CYAN, weight: 1.5, opacity: 0.6,
+      fillColor: COLOR_CYAN, fillOpacity: 0.05,
+      dashArray: "4 6", lineCap: "butt", interactive: false,
     }).addTo(genLayer);
 
     var candidate = L.polyline([], {
-      color: "#fc4c02", weight: 3, opacity: 0.85,
-      dashArray: "2 8", interactive: false,
-    }).addTo(genLayer);
-
-    // Fixed start marker (the user's chosen point).
-    L.circleMarker([start.lat, start.lng], {
-      radius: 6, color: "#0d47a1", weight: 2,
-      fillColor: "#ffffff", fillOpacity: 1, interactive: false,
+      color: COLOR_ORANGE, weight: 3, opacity: 0.9,
+      dashArray: "6 6", lineCap: "butt", interactive: false,
     }).addTo(genLayer);
 
     var NUM = 5;
@@ -573,8 +728,8 @@
     for (var i = 1; i < NUM; i++) {
       wpMarkers.push(
         L.circleMarker([start.lat, start.lng], {
-          radius: 5, color: "#fc4c02", weight: 2,
-          fillColor: "#ffd9c7", fillOpacity: 1, interactive: false,
+          radius: 5, color: COLOR_DEEP, weight: 2,
+          fillColor: COLOR_LIME, fillOpacity: 1, interactive: false,
         }).addTo(genLayer)
       );
     }
@@ -733,22 +888,22 @@
       awayY = -sy / mag;
     }
 
-    var LABEL_OFFSET_M = 38;
-    var labelPoint = offsetPointLngLat(start, awayX, awayY, LABEL_OFFSET_M);
+    // The orange start pin already sits on the exact point; the lime finish
+    // flag goes just outside the loop. The offset is in screen pixels (via the
+    // icon anchor) so the gap stays the same at every zoom level. The pin is
+    // drawn above its point, so a flag heading north needs a longer reach.
+    var reachPx = 44 + 22 * Math.max(0, awayY);
+    var flagIcon = L.divIcon({
+      className: FINISH_FLAG_ICON.options.className,
+      html: FINISH_FLAG_ICON.options.html,
+      iconSize: FINISH_FLAG_ICON.options.iconSize,
+      // Screen y grows downward, so north (awayY > 0) moves the icon up.
+      iconAnchor: [17 - awayX * reachPx, 17 + awayY * reachPx],
+    });
 
-    var flagHtml =
-      '<div class="route-flag route-flag-startfinish">' +
-        '<div class="route-flag-label">START/FINISH</div>' +
-      '</div>';
-
-    L.marker([labelPoint[1], labelPoint[0]], {
+    L.marker([start[1], start[0]], {
       interactive: false, keyboard: false, zIndexOffset: 1000,
-      icon: L.divIcon({
-        className: "startfinish-flag-icon",
-        html: flagHtml,
-        iconSize:   [150, 34],
-        iconAnchor: [75, 17],
-      }),
+      icon: flagIcon,
     }).addTo(routeHighlightLayer);
   }
 
@@ -794,7 +949,7 @@
       var bo = offsetPointLngLat(b, nx, ny, OVERLAP_OFFSET_METERS);
 
       L.polyline([[ao[1], ao[0]], [bo[1], bo[0]]], {
-        color: "#42a5f5", weight: 3, opacity: 0.95, interactive: false,
+        color: COLOR_CYAN, weight: 3, opacity: 0.95, interactive: false,
       }).addTo(routeOverlapLayer);
     }
   }
@@ -856,8 +1011,10 @@
           html: '<svg width="18" height="18" viewBox="0 0 18 18" ' +
                 'style="transform:rotate(' + (p.bearing - 90) + 'deg);' +
                 'transform-origin:center center;opacity:0.95;">' +
-                '<path d="M3 4 L11 9 L3 14" stroke="#111111" stroke-width="3" fill="none" ' +
-                'stroke-linecap="round" stroke-linejoin="round"></path></svg>',
+                '<path d="M4 4 L11 9 L4 14" stroke="' + COLOR_DEEP + '" stroke-width="5" fill="none" ' +
+                'stroke-linecap="square" stroke-linejoin="miter"></path>' +
+                '<path d="M4 4 L11 9 L4 14" stroke="' + COLOR_CREAM + '" stroke-width="2.2" fill="none" ' +
+                'stroke-linecap="square" stroke-linejoin="miter"></path></svg>',
           iconSize: [18, 18], iconAnchor: [9, 9],
         }),
       }).addTo(routeDirectionLayer);
@@ -871,10 +1028,18 @@
   function drawRoute(geojsonLineString) {
     clearRouteVisuals();
 
-    routeLayer = L.geoJSON(
-      { type: "Feature", geometry: geojsonLineString, properties: {} },
-      { style: { color: "#0d47a1", weight: 5, opacity: 0.88 } }
-    ).addTo(map);
+    // Three stacked strokes: a soft orange glow, the solid route, and a thin
+    // cream dash down the middle for the "plotted track" look.
+    var latLngs = toLeafletLine(geojsonLineString.coordinates);
+    routeLayer = L.featureGroup([
+      L.polyline(latLngs, { color: COLOR_ORANGE, weight: 16, opacity: 0.16, interactive: false }),
+      L.polyline(latLngs, { color: COLOR_DEEP,   weight: 8,  opacity: 0.85, interactive: false }),
+      L.polyline(latLngs, { color: COLOR_ORANGE, weight: 5,  opacity: 1,    interactive: false }),
+      L.polyline(latLngs, {
+        color: COLOR_CREAM, weight: 1.5, opacity: 0.9,
+        dashArray: "3 9", lineCap: "butt", interactive: false,
+      }),
+    ]).addTo(map);
 
     drawStartEndHighlights(geojsonLineString.coordinates);
     drawOppositeDirectionOffsets(geojsonLineString.coordinates);
@@ -885,12 +1050,168 @@
     } catch (e) { /* ignore degenerate geometry */ }
   }
 
+  // ---------------------------------------------------------------------------
+  // Route data sidebar
+  // ---------------------------------------------------------------------------
+
+  var SVG_NS = "http://www.w3.org/2000/svg";
+  var CHART_W = 120;
+  var CHART_H = 40;
+  var CHART_COLUMNS = 40; // chunky bars read as "pixel" at any panel width
+
+  function svgEl(name, attrs) {
+    var el = document.createElementNS(SVG_NS, name);
+    Object.keys(attrs).forEach(function (k) { el.setAttribute(k, attrs[k]); });
+    return el;
+  }
+
+  /**
+   * Draw the elevation profile as a stepped (pixel) area chart.
+   *
+   * The samples are bucketed into CHART_COLUMNS columns and drawn as a
+   * staircase, so the chart keeps the blocky look regardless of how many
+   * samples the backend returned. With no samples it shows a flat baseline.
+   */
+  function renderElevationChart(profile, gainM) {
+    while (elevChart.firstChild) { elevChart.removeChild(elevChart.firstChild); }
+
+    var samples = Array.isArray(profile) ? profile.filter(isFinite) : [];
+    if (samples.length < 2) {
+      elevChart.appendChild(svgEl("rect", {
+        class: "elev-empty", x: 0, y: CHART_H - 2, width: CHART_W, height: 2,
+      }));
+      elevChart.setAttribute("aria-label", "Elevation profile unavailable");
+      elevMin.textContent = "-- m";
+      elevMax.textContent = "-- m";
+      return;
+    }
+
+    var lo = Math.min.apply(null, samples);
+    var hi = Math.max.apply(null, samples);
+    // Keep at least 10 m of vertical range so a flat route looks flat
+    // instead of magnifying a 1 m wobble into mountains.
+    var span = Math.max(hi - lo, 10);
+    var cols = Math.min(CHART_COLUMNS, samples.length);
+    var colW = CHART_W / cols;
+    var top = 4; // headroom so the peak isn't glued to the border
+
+    var line = "";
+    for (var c = 0; c < cols; c++) {
+      var from = Math.floor((c * samples.length) / cols);
+      var to = Math.max(from + 1, Math.floor(((c + 1) * samples.length) / cols));
+      var sum = 0;
+      for (var i = from; i < to; i++) { sum += samples[i]; }
+      var avg = sum / (to - from);
+      var y = top + (CHART_H - top - 2) * (1 - (avg - lo) / span);
+      var x0 = c * colW;
+      var x1 = x0 + colW;
+      line += (c === 0 ? "M" : "L") + x0.toFixed(2) + " " + y.toFixed(2) +
+              "L" + x1.toFixed(2) + " " + y.toFixed(2);
+    }
+
+    elevChart.appendChild(svgEl("path", {
+      class: "elev-area", d: line + "L" + CHART_W + " " + CHART_H + "L0 " + CHART_H + "Z",
+    }));
+    elevChart.appendChild(svgEl("path", { class: "elev-line", d: line }));
+    elevChart.setAttribute(
+      "aria-label",
+      "Elevation profile from " + Math.round(lo) + " to " + Math.round(hi) +
+        " metres, " + Math.round(gainM) + " metres total gain"
+    );
+    elevMin.textContent = "Low " + Math.round(lo) + " m";
+    elevMax.textContent = "High " + Math.round(hi) + " m";
+  }
+
+  function setLive(isLive) {
+    liveBadge.dataset.state = isLive ? "live" : "idle";
+    liveBadge.textContent = isLive ? "Live" : "Idle";
+    dataLight.classList.toggle("is-live", isLive);
+  }
+
+  function setSaved(saved) {
+    saveBtn.classList.toggle("is-saved", saved);
+    saveLabel.textContent = saved ? "Route saved" : "Save route";
+    saveBtn.setAttribute(
+      "aria-label",
+      saved ? "Route saved as GPX. Press to download again." : "Save route as a GPX file"
+    );
+  }
+
+  /** Put the sidebar back to its empty "no route" state. */
+  function resetRouteStats() {
+    currentRoute = null;
+    statDistance.textContent = "--";
+    statTime.textContent     = "--";
+    statPace.textContent     = "--";
+    statGain.textContent     = "--";
+    statMaxClimb.textContent = "--";
+    statSignals.textContent  = "--";
+    elevGain.textContent     = "+0 m";
+    renderElevationChart([], 0);
+    setLive(false);
+    setSaved(false);
+    saveBtn.disabled = true;
+  }
+
   function showRouteStats(route) {
-    statDistance.textContent = formatDistanceM(route.distance_meters);
+    currentRoute = route;
+    var km = route.distance_meters / 1000;
+
+    statDistance.textContent = km.toFixed(km >= 10 ? 1 : 2);
+    statTime.textContent     = String(Math.round((km * ASSUMED_PACE_SEC_PER_KM) / 60));
+    statPace.textContent     = formatMinSec(ASSUMED_PACE_SEC_PER_KM);
     statGain.textContent     = formatElevationM(route.elevation_gain_m);
     statMaxClimb.textContent = formatElevationM(route.max_climb_m);
     statSignals.textContent  = String(route.signal_count);
-    routeStatsEl.hidden = false;
+    elevGain.textContent     = "+" + formatElevationM(route.elevation_gain_m);
+    renderElevationChart(route.elevation_profile, route.elevation_gain_m);
+
+    setLive(true);
+    setSaved(false);
+    saveBtn.disabled = false;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Save route — downloads the loop as GPX, which Strava, Garmin Connect,
+  // Komoot and most watches can import. Nothing is stored or uploaded.
+  // ---------------------------------------------------------------------------
+
+  function escapeXml(s) {
+    return String(s).replace(/[<>&'"]/g, function (ch) {
+      return { "<": "&lt;", ">": "&gt;", "&": "&amp;", "'": "&apos;", '"': "&quot;" }[ch];
+    });
+  }
+
+  function buildGpx(route, name) {
+    var pts = route.coordinates.map(function (c) {
+      return '      <trkpt lat="' + c[1].toFixed(6) + '" lon="' + c[0].toFixed(6) + '"></trkpt>';
+    });
+    return (
+      '<?xml version="1.0" encoding="UTF-8"?>\n' +
+      '<gpx version="1.1" creator="Route Runner" xmlns="http://www.topografix.com/GPX/1/1">\n' +
+      "  <metadata><name>" + escapeXml(name) + "</name></metadata>\n" +
+      "  <trk>\n    <name>" + escapeXml(name) + "</name>\n    <type>running</type>\n    <trkseg>\n" +
+      pts.join("\n") +
+      "\n    </trkseg>\n  </trk>\n</gpx>\n"
+    );
+  }
+
+  function saveRoute() {
+    if (!currentRoute) { return; }
+    var km = (currentRoute.distance_meters / 1000).toFixed(1);
+    var name = "Route Runner " + km + " km loop";
+    var blob = new Blob([buildGpx(currentRoute, name)], { type: "application/gpx+xml" });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement("a");
+    a.href = url;
+    a.download = "routerunner-" + km.replace(".", "_") + "km-" + pad2(routeCounter) + ".gpx";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+
+    setSaved(true);
+    setStatus("Route saved as " + a.download + ".");
   }
 
   // ---------------------------------------------------------------------------
@@ -918,10 +1239,9 @@
 
     setStatus("");
     clearRouteVisuals();
-    routeStatsEl.hidden = true;
+    resetRouteStats();
     setLoading(true);
     startGenerationViz(startPoint, targetKm);
-    generateBtn.disabled = true;
 
     fetch(API_GENERATE_ROUTE, {
       method: "POST",
@@ -950,19 +1270,21 @@
       .then(function (route) {
         stopGenerationViz();
         drawRoute({ type: "LineString", coordinates: route.coordinates });
+        routeCounter += 1;
+        routeIdEl.textContent = "Route_" + pad2(routeCounter);
         showRouteStats(route);
+        setLoading(false);
+        setRouteBadge("active", "Route online");
         setStatus("Route ready.");
       })
       .catch(function (err) {
         stopGenerationViz();
         console.error(err);
-        setStatus(err.message || "Could not reach the backend. Make sure it is running.", true);
-        routeStatsEl.hidden = true;
-        clearRouteVisuals();
-      })
-      .finally(function () {
         setLoading(false);
-        generateBtn.disabled = false;
+        resetRouteStats();
+        setRouteBadge("error", "Route failed");
+        setStatus(err.message || "Could not reach the backend. Make sure it is running.", true);
+        clearRouteVisuals();
       });
   }
 
@@ -976,10 +1298,11 @@
     setStatus("Start point set. Adjust distance, then generate.");
   });
 
-  // Typing drives the suggestions; the button forces an immediate search
-  // (handy for retrying after a network hiccup).
+  // Typing drives the suggestions; Enter forces an immediate search (handy
+  // for retrying after a network hiccup).
   searchInput.addEventListener("input", queueLocationSearch);
-  searchBtn.addEventListener("click", function () { runLocationSearch(true); });
+  locateBtn.addEventListener("click", function () { locateUser(true); });
+  saveBtn.addEventListener("click", saveRoute);
 
   searchInput.addEventListener("keydown", function (ev) {
     if (ev.key === "ArrowDown") {
@@ -1035,7 +1358,10 @@
     syncDistanceLabel();
   });
 
+  distanceInput.addEventListener("change", clampDistanceInput);
+
   syncDistanceLabel();
+  resetRouteStats();
 
   generateBtn.addEventListener("click", generateRoute);
 
@@ -1048,5 +1374,5 @@
   });
 
   // Try to centre the map on the user's real location on first load.
-  setTimeout(initializeUserLocation, 0);
+  setTimeout(function () { locateUser(false); }, 0);
 })();

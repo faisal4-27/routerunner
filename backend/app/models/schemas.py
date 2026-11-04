@@ -38,3 +38,6 @@ class RouteCandidate(BaseModel):
     elevation_gain_m: float
     max_climb_m: float
     signal_count: int
+    # Elevation samples (metres) evenly spaced along the loop, in route order.
+    # Empty when elevation lookup failed; drives the frontend's chart.
+    elevation_profile: List[float] = Field(default_factory=list)
