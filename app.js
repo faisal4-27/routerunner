@@ -1103,9 +1103,12 @@
     var km = route.distance_meters / 1000;
 
     statDistance.textContent = km.toFixed(km >= 10 ? 1 : 2);
-    statMaxClimb.textContent = String(Math.round(route.max_climb_m));
-    elevGain.textContent     = "+" + formatElevationM(route.elevation_gain_m);
-    renderElevationChart(route.elevation_profile, route.elevation_gain_m);
+    // Elevation is best-effort on the backend: null means the lookup failed
+    // (e.g. Open-Meteo quota), so show placeholders instead of fake zeros.
+    var hasElevation = typeof route.elevation_gain_m === "number";
+    statMaxClimb.textContent = hasElevation ? String(Math.round(route.max_climb_m)) : "--";
+    elevGain.textContent     = hasElevation ? "+" + formatElevationM(route.elevation_gain_m) : "-- m";
+    renderElevationChart(hasElevation ? route.elevation_profile : [], route.elevation_gain_m || 0);
 
     setLive(true);
     setSaved(false);

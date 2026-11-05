@@ -27,6 +27,7 @@ How it works:
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import random
 from typing import List, Sequence, Tuple
@@ -42,6 +43,8 @@ from app.utils.geo import (
     count_short_uturns,
     offset_lat_lng,
 )
+
+logger = logging.getLogger(__name__)
 
 # A "short" street for U-turn purposes — the user explicitly does not want
 # any out-and-back on a street shorter than this.
@@ -204,14 +207,32 @@ async def _enrich(
     Traffic signals are deliberately NOT looked up here: the public Overpass
     server can take 30 s+ under load, and that shouldn't hold the route back.
     The frontend asks POST /route-signals separately once the route is drawn.
-    """
-    gain_m, max_climb_m, profile_m = await fetch_elevations_along_route(client, coords)
 
+    Elevation is best-effort: if Open-Meteo fails (quota exhausted on a
+    shared host IP, timeout, bad response) the route is still returned, with
+    the elevation fields left empty so the frontend shows "unavailable".
+    """
+    try:
+        gain_m, max_climb_m, profile_m = await fetch_elevations_along_route(
+            client, coords
+        )
+    except Exception as exc:  # noqa: BLE001 — any elevation failure is non-fatal
+        logger.warning("Elevation lookup failed, returning route without it: %s", exc)
+        return RouteCandidate(
+            coordinates=coords,
+            distance_meters=distance_meters,
+            elevation_gain_m=None,
+            max_climb_m=None,
+            signal_count=None,
+            elevation_profile=[],
+        )
+
+    has_profile = len(profile_m) >= 2
     return RouteCandidate(
         coordinates=coords,
         distance_meters=distance_meters,
-        elevation_gain_m=round(gain_m),
-        max_climb_m=round(max_climb_m),
+        elevation_gain_m=round(gain_m) if has_profile else None,
+        max_climb_m=round(max_climb_m) if has_profile else None,
         signal_count=None,
         elevation_profile=[round(e, 1) for e in profile_m],
     )

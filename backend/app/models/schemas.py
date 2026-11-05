@@ -31,12 +31,15 @@ class RouteCandidate(BaseModel):
     anywhere along the loop — i.e. the toughest single climb the runner
     will face. It replaces an "elevation loss" field that, for any closed
     loop, mathematically had to equal the gain.
+
+    Both elevation fields are None when the elevation lookup failed (e.g.
+    Open-Meteo quota exhausted) — the route itself is still valid.
     """
 
     coordinates: List[List[float]]
     distance_meters: float
-    elevation_gain_m: float
-    max_climb_m: float
+    elevation_gain_m: Optional[float] = None
+    max_climb_m: Optional[float] = None
     # Filled in by POST /route-signals, not by /generate-route, so this is
     # None here. Kept for response-shape compatibility.
     signal_count: Optional[int] = None
