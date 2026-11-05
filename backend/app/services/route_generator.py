@@ -10,8 +10,9 @@ How it works:
    profile, continue_straight=true). Tuning iterations use overview=false
    so OSRM doesn't have to serialize the polyline every time.
 4. Compare the total routed distance against the target; if it's outside
-   ±8 %, push each waypoint inward or outward, weighted by how off its own
-   leg was, and rebuild. Up to a few distance iterations per layout.
+   ±8 %, rescale the whole circle by target/actual and rebuild, keeping the
+   closest layout seen. Up to a few distance iterations per layout; if no
+   orientation lands in tolerance, one extra parallel round is tried.
 5. Run several circle orientations *in parallel* (each its own asyncio task)
    instead of one-after-another, so the wall-clock cost is roughly a single
    layout's latency rather than the sum of all of them. Each layout fetches
@@ -266,6 +267,7 @@ async def _run_attempt(
     scales = [1.0] * NUM_POINTS
     radius_m = base_radius_m
     chosen_points: List[Tuple[float, float]] | None = None
+    best_abs_err = math.inf
     last_error: Exception | None = None
 
     # Tuning loop: ask OSRM for distances only (overview=false) — the payload
@@ -286,12 +288,26 @@ async def _run_attempt(
 
         leg_distances = result["leg_distances"]
         total_m = result["total_distance"]
-        chosen_points = points
+        abs_err = abs(target_m - total_m)
 
-        if abs(target_m - total_m) <= tolerance_m:
+        # Keep the closest layout seen so far, not just the last one tried —
+        # a late iteration can overshoot and land further from the target.
+        if abs_err < best_abs_err:
+            best_abs_err = abs_err
+            chosen_points = points
+
+        if abs_err <= tolerance_m:
             break
 
-        scales = _adjust_scales(scales, leg_distances, target_m)
+        # Routed length scales roughly linearly with the circle's radius, so
+        # first rescale the whole loop by target/actual. Street grids, rivers
+        # and parks often make the first try 1.5–2.5x too long, which the
+        # per-waypoint nudges below can't fix alone (they're clamped and the
+        # start point is fixed). Clamp the step so one odd detour can't wreck it.
+        if total_m > 0:
+            radius_m *= max(0.5, min(1.6, target_m / total_m))
+        else:
+            scales = _adjust_scales(scales, leg_distances, target_m)
 
     if chosen_points is None:
         return None, last_error
@@ -337,18 +353,17 @@ async def generate_route(
     base_radius_m = target_m / (2.0 * math.pi)
     tolerance_m = max(150.0, target_m * DISTANCE_TOLERANCE_FRAC)
 
-    # Spread the orientations evenly around the circle with a random phase, so
-    # repeated clicks on the same start don't reproduce an identical loop and
-    # the parallel attempts explore genuinely different layouts.
-    phase = random.uniform(0.0, 360.0)
-    step = 360.0 / ROTATION_ATTEMPTS
-    rotations = [
-        (phase + i * step + random.uniform(-10.0, 10.0)) % 360.0
-        for i in range(ROTATION_ATTEMPTS)
-    ]
-
-    async with httpx.AsyncClient() as client:
-        results = await asyncio.gather(
+    async def _round(client: httpx.AsyncClient) -> List[Tuple[_Candidate | None, Exception | None]]:
+        # Spread the orientations evenly around the circle with a random
+        # phase, so repeated clicks on the same start don't reproduce an
+        # identical loop and the parallel attempts explore different layouts.
+        phase = random.uniform(0.0, 360.0)
+        step = 360.0 / ROTATION_ATTEMPTS
+        rotations = [
+            (phase + i * step + random.uniform(-10.0, 10.0)) % 360.0
+            for i in range(ROTATION_ATTEMPTS)
+        ]
+        return await asyncio.gather(
             *(
                 _run_attempt(
                     client, lat, lng, base_radius_m, rot, target_m, tolerance_m
@@ -356,6 +371,14 @@ async def generate_route(
                 for rot in rotations
             )
         )
+
+    async with httpx.AsyncClient() as client:
+        results = list(await _round(client))
+
+        # If no layout landed inside the tolerance, spend one more parallel
+        # round on fresh orientations before settling for an off-target loop.
+        if not any(c is not None and c["in_tolerance"] for c, _ in results):
+            results.extend(await _round(client))
 
         candidates = [c for c, _ in results if c is not None]
         last_error = next((e for _, e in results if e is not None), None)
@@ -366,16 +389,23 @@ async def generate_route(
                 "distance. Try a different start point or distance."
             )
 
-        # A flawless loop wins regardless of score; among several, take the
-        # one with the best (lowest) weighted score.
+        # Tiered pick: a flawless loop wins outright; otherwise any
+        # in-tolerance loop beats every out-of-tolerance one (the score alone
+        # could let a clean-but-15 %-off loop beat a 5 %-off loop with a
+        # U-turn). Within a tier, lowest weighted score wins.
+        in_tolerance = [c for c in candidates if c["in_tolerance"]]
         flawless = [
             c
-            for c in candidates
-            if c["in_tolerance"]
-            and c["short_uturns"] == 0
-            and c["double_backs"] == 0
+            for c in in_tolerance
+            if c["short_uturns"] == 0 and c["double_backs"] == 0
         ]
-        pool = flawless or candidates
+        pool = flawless or in_tolerance or candidates
         best = min(pool, key=lambda c: c["score"])
+        if not best["in_tolerance"]:
+            logger.info(
+                "No in-tolerance loop found; returning closest (%.0f m vs %.0f m target)",
+                best["total_m"],
+                target_m,
+            )
 
         return await _enrich(client, best["coords"], best["total_m"])

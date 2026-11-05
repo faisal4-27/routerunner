@@ -1019,7 +1019,7 @@
    * staircase, so the chart keeps the blocky look regardless of how many
    * samples the backend returned. With no samples it shows a flat baseline.
    */
-  function renderElevationChart(profile, gainM) {
+  function renderElevationChart(profile, gainM, unavailable) {
     while (elevChart.firstChild) { elevChart.removeChild(elevChart.firstChild); }
 
     var samples = Array.isArray(profile) ? profile.filter(isFinite) : [];
@@ -1027,9 +1027,17 @@
       elevChart.appendChild(svgEl("rect", {
         class: "elev-empty", x: 0, y: CHART_H - 2, width: CHART_W, height: 2,
       }));
-      elevChart.setAttribute("aria-label", "Elevation profile unavailable");
-      elevMin.textContent = "-- m";
-      elevMax.textContent = "-- m";
+      if (unavailable) {
+        // A route exists but the elevation lookup failed — say so plainly
+        // rather than leaving an empty chart that looks like a bug.
+        elevChart.setAttribute("aria-label", "Elevation data unavailable for this route");
+        elevMin.textContent = "Elevation unavailable";
+        elevMax.textContent = "";
+      } else {
+        elevChart.setAttribute("aria-label", "Elevation profile: no route yet");
+        elevMin.textContent = "-- m";
+        elevMax.textContent = "-- m";
+      }
       return;
     }
 
@@ -1106,9 +1114,13 @@
     // Elevation is best-effort on the backend: null means the lookup failed
     // (e.g. Open-Meteo quota), so show placeholders instead of fake zeros.
     var hasElevation = typeof route.elevation_gain_m === "number";
-    statMaxClimb.textContent = hasElevation ? String(Math.round(route.max_climb_m)) : "--";
-    elevGain.textContent     = hasElevation ? "+" + formatElevationM(route.elevation_gain_m) : "-- m";
-    renderElevationChart(hasElevation ? route.elevation_profile : [], route.elevation_gain_m || 0);
+    statMaxClimb.textContent = hasElevation ? String(Math.round(route.max_climb_m)) : "N/A";
+    elevGain.textContent     = hasElevation ? "+" + formatElevationM(route.elevation_gain_m) : "Unavailable";
+    renderElevationChart(
+      hasElevation ? route.elevation_profile : [],
+      route.elevation_gain_m || 0,
+      !hasElevation
+    );
 
     setLive(true);
     setSaved(false);
