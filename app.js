@@ -30,6 +30,15 @@
   // route back.
   var API_ROUTE_SIGNALS = API_BASE_URL.replace(/\/$/, "") + "/route-signals";
 
+  // Elevation is fetched from Open-Meteo straight from the browser, for the
+  // same per-IP reason as geocoding below: Open-Meteo's free quota is per IP,
+  // and our Render backend shares its outbound IP with other customers, which
+  // kept exhausting the daily limit. The backend endpoint is only a fallback.
+  var OPEN_METEO_ELEVATION_URL = "https://api.open-meteo.com/v1/elevation";
+  var API_ROUTE_ELEVATION = API_BASE_URL.replace(/\/$/, "") + "/route-elevation";
+  var ELEVATION_MAX_SAMPLES = 96; // one Open-Meteo request (limit is 100)
+  var ELEVATION_TIMEOUT_MS = 15000;
+
   // Location search (geocoding) is called straight from the browser rather
   // than proxied through our backend. The provider rate-limits per IP, so
   // going direct gives every visitor their own budget instead of sharing the
@@ -1019,7 +1028,11 @@
    * staircase, so the chart keeps the blocky look regardless of how many
    * samples the backend returned. With no samples it shows a flat baseline.
    */
-  function renderElevationChart(profile, gainM, unavailable) {
+  /**
+   * `emptyState` only matters when there are no samples: "loading" while the
+   * lookup is in flight, "unavailable" when it failed, otherwise "no route".
+   */
+  function renderElevationChart(profile, gainM, emptyState) {
     while (elevChart.firstChild) { elevChart.removeChild(elevChart.firstChild); }
 
     var samples = Array.isArray(profile) ? profile.filter(isFinite) : [];
@@ -1027,7 +1040,11 @@
       elevChart.appendChild(svgEl("rect", {
         class: "elev-empty", x: 0, y: CHART_H - 2, width: CHART_W, height: 2,
       }));
-      if (unavailable) {
+      if (emptyState === "loading") {
+        elevChart.setAttribute("aria-label", "Loading elevation profile");
+        elevMin.textContent = "Loading elevation...";
+        elevMax.textContent = "";
+      } else if (emptyState === "unavailable") {
         // A route exists but the elevation lookup failed — say so plainly
         // rather than leaving an empty chart that looks like a bug.
         elevChart.setAttribute("aria-label", "Elevation data unavailable for this route");
@@ -1096,6 +1113,7 @@
   function resetRouteStats() {
     currentRoute = null;
     cancelSignalCount();
+    cancelElevation();
     statDistance.textContent = "--";
     statMaxClimb.textContent = "--";
     setSignals("--", "junctions");
@@ -1111,21 +1129,156 @@
     var km = route.distance_meters / 1000;
 
     statDistance.textContent = km.toFixed(km >= 10 ? 1 : 2);
-    // Elevation is best-effort on the backend: null means the lookup failed
-    // (e.g. Open-Meteo quota), so show placeholders instead of fake zeros.
-    var hasElevation = typeof route.elevation_gain_m === "number";
-    statMaxClimb.textContent = hasElevation ? String(Math.round(route.max_climb_m)) : "N/A";
-    elevGain.textContent     = hasElevation ? "+" + formatElevationM(route.elevation_gain_m) : "Unavailable";
-    renderElevationChart(
-      hasElevation ? route.elevation_profile : [],
-      route.elevation_gain_m || 0,
-      !hasElevation
-    );
 
     setLive(true);
     setSaved(false);
     saveBtn.disabled = false;
     loadSignalCount(route);
+    loadElevation(route);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Elevation — fetched after the route is shown, browser → Open-Meteo first,
+  // backend /route-elevation as the fallback (see OPEN_METEO_ELEVATION_URL)
+  // ---------------------------------------------------------------------------
+
+  /** @type {AbortController|null} In-flight elevation lookup, cancelled by a new route. */
+  var elevationAbort = null;
+
+  function cancelElevation() {
+    if (elevationAbort) { elevationAbort.abort(); elevationAbort = null; }
+  }
+
+  /** Keep every Nth vertex (first and last always kept) — mirrors the backend. */
+  function sampleCoords(coords, maxPoints) {
+    if (coords.length <= maxPoints) { return coords.slice(); }
+    var step = Math.ceil(coords.length / maxPoints);
+    var out = [];
+    for (var i = 0; i < coords.length - 1; i += step) { out.push(coords[i]); }
+    var last = coords[coords.length - 1];
+    var tail = out[out.length - 1];
+    if (!tail || tail[0] !== last[0] || tail[1] !== last[1]) { out.push(last); }
+    return out;
+  }
+
+  /**
+   * Total gain (sum of every uphill step) and the biggest single climb
+   * (largest low-to-high rise, via a running minimum). Same maths as the
+   * backend's elevation_stats().
+   */
+  function elevationStats(profile) {
+    var gain = 0;
+    var maxClimb = 0;
+    var minSoFar = profile[0];
+    for (var i = 1; i < profile.length; i++) {
+      var curr = profile[i];
+      if (curr > profile[i - 1]) { gain += curr - profile[i - 1]; }
+      if (curr < minSoFar) { minSoFar = curr; }
+      else if (curr - minSoFar > maxClimb) { maxClimb = curr - minSoFar; }
+    }
+    return { gain: gain, maxClimb: maxClimb };
+  }
+
+  /** Abort `controller` after ms, unless it settles first. Returns a cancel fn. */
+  function abortAfter(controller, ms) {
+    var t = setTimeout(function () { controller.abort(); }, ms);
+    return function () { clearTimeout(t); };
+  }
+
+  /** Browser → Open-Meteo. Resolves to the elevation profile (metres). */
+  function fetchElevationDirect(samples, signal) {
+    var url = OPEN_METEO_ELEVATION_URL +
+      "?latitude=" + samples.map(function (c) { return c[1].toFixed(5); }).join(",") +
+      "&longitude=" + samples.map(function (c) { return c[0].toFixed(5); }).join(",");
+    return fetch(url, { signal: signal, cache: "no-store" })
+      .then(function (res) {
+        return res.json().then(function (data) {
+          if (!res.ok || data.error) {
+            throw new Error("Open-Meteo: " + (data.reason || "HTTP " + res.status));
+          }
+          var profile = (data.elevation || []).filter(function (v) {
+            return typeof v === "number" && isFinite(v);
+          });
+          if (profile.length < 2) { throw new Error("Open-Meteo: no usable samples"); }
+          return profile;
+        });
+      });
+  }
+
+  /** Browser → our backend → Open-Meteo. Fallback only (shared server IP). */
+  function fetchElevationViaBackend(samples, signal) {
+    return fetch(API_ROUTE_ELEVATION, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      cache: "no-store",
+      body: JSON.stringify({ coordinates: samples }),
+      signal: signal,
+    }).then(function (res) {
+      if (!res.ok) { throw new Error("Elevation fallback HTTP " + res.status); }
+      return res.json();
+    }).then(function (data) { return data.elevation_profile; });
+  }
+
+  function showElevation(profile) {
+    var s = elevationStats(profile);
+    statMaxClimb.textContent = String(Math.round(s.maxClimb));
+    elevGain.textContent     = "+" + formatElevationM(s.gain);
+    renderElevationChart(profile, s.gain);
+  }
+
+  function loadElevation(route) {
+    cancelElevation();
+    var controller = new AbortController();
+    elevationAbort = controller;
+
+    statMaxClimb.textContent = "...";
+    elevGain.textContent     = "...";
+    renderElevationChart([], 0, "loading");
+
+    var samples = (route.elevation_samples && route.elevation_samples.length >= 2)
+      ? route.elevation_samples
+      : sampleCoords(route.coordinates || [], ELEVATION_MAX_SAMPLES);
+    if (samples.length < 2) {
+      elevationAbort = null;
+      statMaxClimb.textContent = "--";
+      elevGain.textContent     = "Unavailable";
+      renderElevationChart([], 0, "unavailable");
+      return;
+    }
+
+    // Each attempt gets its own timeout; aborting `controller` (a new route)
+    // cancels whichever attempt is running.
+    function attempt(fn) {
+      var inner = new AbortController();
+      var onOuterAbort = function () { inner.abort(); };
+      controller.signal.addEventListener("abort", onOuterAbort);
+      var clear = abortAfter(inner, ELEVATION_TIMEOUT_MS);
+      return fn(samples, inner.signal).finally(function () {
+        clear();
+        controller.signal.removeEventListener("abort", onOuterAbort);
+      });
+    }
+
+    attempt(fetchElevationDirect)
+      .catch(function (err) {
+        if (controller.signal.aborted) { throw err; }
+        console.warn("Direct elevation lookup failed, trying backend:", err);
+        return attempt(fetchElevationViaBackend);
+      })
+      .then(function (profile) {
+        if (elevationAbort !== controller) { return; }
+        showElevation(profile);
+      })
+      .catch(function (err) {
+        if (elevationAbort !== controller) { return; }
+        console.error(err);
+        statMaxClimb.textContent = "--";
+        elevGain.textContent     = "Unavailable";
+        renderElevationChart([], 0, "unavailable");
+      })
+      .finally(function () {
+        if (elevationAbort === controller) { elevationAbort = null; }
+      });
   }
 
   // ---------------------------------------------------------------------------

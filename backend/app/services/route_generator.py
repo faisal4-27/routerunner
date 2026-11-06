@@ -20,9 +20,9 @@ How it works:
    score — distance accuracy counts for 50 %, short U-turns 25 %, and
    double-backs 25 % — and keep the best. A perfectly in-tolerance, clean
    loop still wins outright and is returned as soon as the layouts resolve.
-6. Enrich the chosen route with elevation data. Traffic signals come from a
-   separate endpoint (POST /route-signals) so a slow Overpass can't delay
-   the route itself.
+6. Return the route with evenly spaced sample points. Elevation is fetched
+   by the browser (fallback: POST /route-elevation) and traffic signals by
+   POST /route-signals, so neither can delay or break the route itself.
 """
 
 from __future__ import annotations
@@ -36,13 +36,14 @@ from typing import List, Sequence, Tuple
 import httpx
 
 from app.models.schemas import RouteCandidate
-from app.services.elevation import fetch_elevations_along_route
+from app.services.elevation import ELEVATION_MAX_SAMPLES
 from app.services.osrm import OsrmError, fetch_osrm_route_through_points
 from app.utils.geo import (
     LngLat,
     count_double_back_segments,
     count_short_uturns,
     offset_lat_lng,
+    sample_line_coords,
 )
 
 logger = logging.getLogger(__name__)
@@ -197,45 +198,29 @@ def _candidate_score(
     )
 
 
-async def _enrich(
-    client: httpx.AsyncClient,
-    coords: List[LngLat],
-    distance_meters: float,
-) -> RouteCandidate:
+def _to_candidate(coords: List[LngLat], distance_meters: float) -> RouteCandidate:
     """
-    Attach elevation stats to a finished route.
+    Package a finished route for the client.
 
-    Traffic signals are deliberately NOT looked up here: the public Overpass
-    server can take 30 s+ under load, and that shouldn't hold the route back.
-    The frontend asks POST /route-signals separately once the route is drawn.
+    Neither elevation nor traffic signals are looked up here, so the route
+    comes back as fast as OSRM allows:
 
-    Elevation is best-effort: if Open-Meteo fails (quota exhausted on a
-    shared host IP, timeout, bad response) the route is still returned, with
-    the elevation fields left empty so the frontend shows "unavailable".
+    * Elevation — the browser calls Open-Meteo directly with
+      `elevation_samples`. Open-Meteo's free quota is per IP, and Render's
+      outbound IPs are shared with other customers, so server-side lookups
+      kept hitting "Daily API request limit exceeded". POST /route-elevation
+      remains as the client's fallback.
+    * Traffic signals — the public Overpass server can take 30 s+, so the
+      frontend asks POST /route-signals once the route is drawn.
     """
-    try:
-        gain_m, max_climb_m, profile_m = await fetch_elevations_along_route(
-            client, coords
-        )
-    except Exception as exc:  # noqa: BLE001 — any elevation failure is non-fatal
-        logger.warning("Elevation lookup failed, returning route without it: %s", exc)
-        return RouteCandidate(
-            coordinates=coords,
-            distance_meters=distance_meters,
-            elevation_gain_m=None,
-            max_climb_m=None,
-            signal_count=None,
-            elevation_profile=[],
-        )
-
-    has_profile = len(profile_m) >= 2
     return RouteCandidate(
         coordinates=coords,
         distance_meters=distance_meters,
-        elevation_gain_m=round(gain_m) if has_profile else None,
-        max_climb_m=round(max_climb_m) if has_profile else None,
+        elevation_gain_m=None,
+        max_climb_m=None,
         signal_count=None,
-        elevation_profile=[round(e, 1) for e in profile_m],
+        elevation_profile=[],
+        elevation_samples=sample_line_coords(coords, ELEVATION_MAX_SAMPLES),
     )
 
 
@@ -408,4 +393,4 @@ async def generate_route(
                 target_m,
             )
 
-        return await _enrich(client, best["coords"], best["total_m"])
+        return _to_candidate(best["coords"], best["total_m"])

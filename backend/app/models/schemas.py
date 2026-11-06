@@ -32,8 +32,10 @@ class RouteCandidate(BaseModel):
     will face. It replaces an "elevation loss" field that, for any closed
     loop, mathematically had to equal the gain.
 
-    Both elevation fields are None when the elevation lookup failed (e.g.
-    Open-Meteo quota exhausted) — the route itself is still valid.
+    Elevation is NOT looked up by /generate-route: the browser fetches it
+    from Open-Meteo itself (each user's own IP quota, instead of the shared
+    Render IP), using `elevation_samples`, and falls back to POST
+    /route-elevation. The elevation fields here stay None / empty.
     """
 
     coordinates: List[List[float]]
@@ -46,6 +48,23 @@ class RouteCandidate(BaseModel):
     # Elevation samples (metres) evenly spaced along the loop, in route order.
     # Empty when elevation lookup failed; drives the frontend's chart.
     elevation_profile: List[float] = Field(default_factory=list)
+    # Evenly spaced [lng, lat] points along the loop (≤ 96) for the client's
+    # elevation lookup — one Open-Meteo request's worth.
+    elevation_samples: List[List[float]] = Field(default_factory=list)
+
+
+class RouteElevationRequest(BaseModel):
+    """Body for POST /route-elevation: sampled [lng, lat] points in route order."""
+
+    coordinates: List[List[float]] = Field(..., min_length=2, max_length=100)
+
+
+class RouteElevationResponse(BaseModel):
+    """Elevation stats for a route; same meaning as on RouteCandidate."""
+
+    elevation_gain_m: float
+    max_climb_m: float
+    elevation_profile: List[float]
 
 
 class RouteSignalsRequest(BaseModel):
