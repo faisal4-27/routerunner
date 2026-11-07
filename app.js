@@ -30,6 +30,19 @@
   // route back.
   var API_ROUTE_SIGNALS = API_BASE_URL.replace(/\/$/, "") + "/route-signals";
 
+  // Traffic signals are counted by querying Overpass (OpenStreetMap) straight
+  // from the browser; the backend endpoint above is only the fallback. The
+  // Render backend's shared outbound IP was refused outright by
+  // overpass-api.de ("All connection attempts failed"), and per-visitor
+  // requests are also what Overpass's fair-use policy expects.
+  // Must match backend/app/services/overpass.py.
+  var OVERPASS_URL = "https://overpass-api.de/api/interpreter";
+  var SIGNAL_SEARCH_RADIUS_M = 35;   // a signal counts within 35 m of the route
+  var INTERSECTION_CLUSTER_M = 30;   // signals closer than this = one junction
+  var SIGNAL_MAX_LINE_VERTICES = 300;
+  var SIGNAL_BBOX_PAD_DEG = 0.0005;
+  var SIGNAL_TIMEOUT_MS = 60000;     // Overpass can queue for 30–45 s when busy
+
   // Elevation is looked up from the browser, in this order:
   //
   // 1. AWS Terrain Tiles (Mapzen "terrarium" PNGs, AWS Open Data). Bare-earth
@@ -1612,26 +1625,116 @@
     if (signalsAbort) { signalsAbort.abort(); signalsAbort = null; }
   }
 
-  function loadSignalCount(route) {
-    cancelSignalCount();
-    var controller = new AbortController();
-    signalsAbort = controller;
-    setSignals("...", "counting");
+  /** One Overpass QL query for signal nodes near the route (bbox first, then distance). */
+  function buildSignalQuery(coords) {
+    var lats = coords.map(function (c) { return c[1]; });
+    var lngs = coords.map(function (c) { return c[0]; });
+    var pad = SIGNAL_BBOX_PAD_DEG;
+    var bbox = [
+      Math.min.apply(null, lats) - pad, Math.min.apply(null, lngs) - pad,
+      Math.max.apply(null, lats) + pad, Math.max.apply(null, lngs) + pad,
+    ].map(function (v) { return v.toFixed(6); }).join(",");
+    var line = sampleCoords(coords, SIGNAL_MAX_LINE_VERTICES).map(function (c) {
+      return c[1].toFixed(6) + "," + c[0].toFixed(6);
+    }).join(",");
+    return "[out:json][timeout:25];\n" +
+      'node["highway"="traffic_signals"](' + bbox + ")->.signals;\n" +
+      "node.signals(around:" + SIGNAL_SEARCH_RADIUS_M + "," + line + ");\n" +
+      "out skel qt;";
+  }
 
-    fetch(API_ROUTE_SIGNALS, {
+  /**
+   * Group signal nodes closer than INTERSECTION_CLUSTER_M and count the
+   * groups: OSM often maps one junction as a node per approach, and a runner
+   * only stops once per junction.
+   */
+  function countIntersections(points) {
+    var parent = points.map(function (_, i) { return i; });
+    function find(i) {
+      while (parent[i] !== i) { parent[i] = parent[parent[i]]; i = parent[i]; }
+      return i;
+    }
+    for (var i = 0; i < points.length; i++) {
+      for (var j = i + 1; j < points.length; j++) {
+        if (haversineM(points[i], points[j]) <= INTERSECTION_CLUSTER_M) {
+          parent[find(i)] = find(j);
+        }
+      }
+    }
+    var roots = {};
+    points.forEach(function (_, k) { roots[find(k)] = true; });
+    return Object.keys(roots).length;
+  }
+
+  /** Browser → Overpass. Resolves to the number of signal-controlled junctions. */
+  function fetchSignalsDirect(coords, signal) {
+    return fetch(OVERPASS_URL, {
+      method: "POST",
+      // Form-encoded body keeps this a "simple" CORS request (no preflight).
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: "data=" + encodeURIComponent(buildSignalQuery(coords)),
+      signal: signal,
+    })
+      .then(function (res) {
+        if (!res.ok) { throw new Error("Overpass HTTP " + res.status); }
+        return res.json();
+      })
+      .then(function (data) {
+        // Overpass reports query timeouts inside a 200 response.
+        if (/runtime error/i.test(data.remark || "")) {
+          throw new Error("Overpass: " + data.remark.slice(0, 200));
+        }
+        var points = (data.elements || [])
+          .filter(function (el) { return el.type === "node" && isFinite(el.lat) && isFinite(el.lon); })
+          .map(function (el) { return [el.lon, el.lat]; });
+        return countIntersections(points);
+      });
+  }
+
+  /** Browser → our backend → Overpass. Fallback only (shared server IP). */
+  function fetchSignalsViaBackend(coords, signal) {
+    return fetch(API_ROUTE_SIGNALS, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       cache: "no-store",
-      body: JSON.stringify({ coordinates: route.coordinates }),
-      signal: controller.signal,
+      body: JSON.stringify({ coordinates: coords }),
+      signal: signal,
     })
       .then(function (res) {
         if (!res.ok) { throw new Error("Signal lookup HTTP " + res.status); }
         return res.json();
       })
-      .then(function (data) {
+      .then(function (data) { return data.signal_count; });
+  }
+
+  function loadSignalCount(route) {
+    cancelSignalCount();
+    var controller = new AbortController();
+    signalsAbort = controller;
+    setSignals("...", "counting");
+    var coords = route.coordinates || [];
+
+    // Same pattern as elevation: each attempt has its own timeout, and a
+    // new route (aborting `controller`) cancels whichever one is running.
+    function attempt(fn) {
+      var inner = new AbortController();
+      var onOuterAbort = function () { inner.abort(); };
+      controller.signal.addEventListener("abort", onOuterAbort);
+      var clear = abortAfter(inner, SIGNAL_TIMEOUT_MS);
+      return fn(coords, inner.signal).finally(function () {
+        clear();
+        controller.signal.removeEventListener("abort", onOuterAbort);
+      });
+    }
+
+    (coords.length < 2 ? Promise.resolve(0) : attempt(fetchSignalsDirect))
+      .catch(function (err) {
+        if (controller.signal.aborted) { throw err; }
+        console.warn("Direct Overpass lookup failed, trying backend:", err);
+        return attempt(fetchSignalsViaBackend);
+      })
+      .then(function (n) {
         if (signalsAbort !== controller) { return; }
-        var n = data.signal_count;
         setSignals(String(n), n === 1 ? "junction" : "junctions");
       })
       .catch(function (err) {
