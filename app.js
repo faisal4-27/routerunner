@@ -36,7 +36,16 @@
   // overpass-api.de ("All connection attempts failed"), and per-visitor
   // requests are also what Overpass's fair-use policy expects.
   // Must match backend/app/services/overpass.py.
-  var OVERPASS_URL = "https://overpass-api.de/api/interpreter";
+  // Tried in order. The main server often rejects a query instantly when busy
+  // (Chrome shows that as a "CORS error"), so it gets a couple of delayed
+  // retries before we move on. overpass.kumi.systems is an alias of the
+  // private.coffee server, so listing both would only hit the same machine.
+  var OVERPASS_URLS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
+  ];
+  var SIGNAL_RETRY_DELAYS_MS = [2000, 5000]; // extra tries on the main server
+  var SIGNAL_BACKUP_TIMEOUT_MS = 25000;      // don't wait long on the backup
   var SIGNAL_SEARCH_RADIUS_M = 35;   // a signal counts within 35 m of the route
   var INTERSECTION_CLUSTER_M = 30;   // signals closer than this = one junction
   var SIGNAL_MAX_LINE_VERTICES = 300;
@@ -1666,9 +1675,9 @@
     return Object.keys(roots).length;
   }
 
-  /** Browser → Overpass. Resolves to the number of signal-controlled junctions. */
-  function fetchSignalsDirect(coords, signal) {
-    return fetch(OVERPASS_URL, {
+  /** Browser → one Overpass server. Resolves to the number of signal-controlled junctions. */
+  function fetchSignalsDirect(url, coords, signal) {
+    return fetch(url, {
       method: "POST",
       // Form-encoded body keeps this a "simple" CORS request (no preflight).
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -1716,23 +1725,66 @@
 
     // Same pattern as elevation: each attempt has its own timeout, and a
     // new route (aborting `controller`) cancels whichever one is running.
-    function attempt(fn) {
+    function attempt(fn, timeoutMs) {
       var inner = new AbortController();
       var onOuterAbort = function () { inner.abort(); };
       controller.signal.addEventListener("abort", onOuterAbort);
-      var clear = abortAfter(inner, SIGNAL_TIMEOUT_MS);
+      var clear = abortAfter(inner, timeoutMs);
       return fn(coords, inner.signal).finally(function () {
         clear();
         controller.signal.removeEventListener("abort", onOuterAbort);
       });
     }
 
-    (coords.length < 2 ? Promise.resolve(0) : attempt(fetchSignalsDirect))
-      .catch(function (err) {
-        if (controller.signal.aborted) { throw err; }
-        console.warn("Direct Overpass lookup failed, trying backend:", err);
-        return attempt(fetchSignalsViaBackend);
-      })
+    // Wait `ms`, but stop at once if a new route replaces this one.
+    function wait(ms) {
+      return new Promise(function (resolve, reject) {
+        var t = setTimeout(resolve, ms);
+        controller.signal.addEventListener("abort", function () {
+          clearTimeout(t);
+          var e = new Error("Aborted");
+          e.name = "AbortError";
+          reject(e);
+        }, { once: true });
+      });
+    }
+
+    // Sources in order, one at a time (never in parallel, to respect the
+    // free servers' fair-use rules). The backend goes last: Overpass blocks
+    // Render's IP, but it still works for local development.
+    var plan = [];
+    OVERPASS_URLS.forEach(function (url, i) {
+      var fn = function (c, s) { return fetchSignalsDirect(url, c, s); };
+      var timeoutMs = i === 0 ? SIGNAL_TIMEOUT_MS : SIGNAL_BACKUP_TIMEOUT_MS;
+      plan.push({ source: url, fn: fn, delay: 0, timeoutMs: timeoutMs });
+      if (i === 0) {
+        SIGNAL_RETRY_DELAYS_MS.forEach(function (d) {
+          plan.push({ source: url, fn: fn, delay: d, timeoutMs: timeoutMs });
+        });
+      }
+    });
+    plan.push({ source: "backend", fn: fetchSignalsViaBackend, delay: 0, timeoutMs: SIGNAL_TIMEOUT_MS });
+
+    var timedOut = {}; // a server that hung once won't get retried
+    function run(i) {
+      if (i >= plan.length) {
+        // A plain Error, so the final handler shows "unavailable" rather than
+        // treating a timed-out last attempt as a silent cancellation.
+        return Promise.reject(new Error("All traffic-signal sources failed"));
+      }
+      var step = plan[i];
+      if (timedOut[step.source]) { return run(i + 1); }
+      return (step.delay ? wait(step.delay) : Promise.resolve())
+        .then(function () { return attempt(step.fn, step.timeoutMs); })
+        .catch(function (err) {
+          if (controller.signal.aborted) { throw err; }
+          if (err && err.name === "AbortError") { timedOut[step.source] = true; }
+          console.warn("Traffic-signal lookup failed (" + step.source + "), trying next:", err);
+          return run(i + 1);
+        });
+    }
+
+    (coords.length < 2 ? Promise.resolve(0) : run(0))
       .then(function (n) {
         if (signalsAbort !== controller) { return; }
         setSignals(String(n), n === 1 ? "junction" : "junctions");
