@@ -30,10 +30,23 @@
   // route back.
   var API_ROUTE_SIGNALS = API_BASE_URL.replace(/\/$/, "") + "/route-signals";
 
-  // Elevation is fetched from Open-Meteo straight from the browser, for the
-  // same per-IP reason as geocoding below: Open-Meteo's free quota is per IP,
-  // and our Render backend shares its outbound IP with other customers, which
-  // kept exhausting the daily limit. The backend endpoint is only a fallback.
+  // Elevation is looked up from the browser, in this order:
+  //
+  // 1. AWS Terrain Tiles (Mapzen "terrarium" PNGs, AWS Open Data). Bare-earth
+  //    terrain with ~10 m detail in the US, no API key, no quota, CORS open.
+  //    Tested against USGS 1 m lidar on 8 US routes: gain within 7 m on all.
+  //    Outside the US/UK the tiles fall back to SRTM satellite data, which
+  //    gets heavier smoothing (see ELEVATION_SMOOTHING).
+  // 2. Open-Meteo — fallback. Its 90 m model includes buildings, so in
+  //    downtowns it reported up to 14x the real gain (Midtown: 344 m vs 24 m),
+  //    and each point costs one call of a ~10,000/day per-IP quota.
+  // 3. Our backend's /route-elevation (Open-Meteo from Render's shared IP).
+  var TERRAIN_TILE_URL =
+    "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png";
+  var TERRAIN_MAX_ZOOM = 14;  // ~10 m/pixel; z15 was no more accurate in tests
+  var TERRAIN_MIN_ZOOM = 11;
+  var TERRAIN_MAX_TILES = 16; // long routes step down a zoom level instead
+  var TERRAIN_SPACING_M = 25; // sample the route every 25 m
   var OPEN_METEO_ELEVATION_URL = "https://api.open-meteo.com/v1/elevation";
   var API_ROUTE_ELEVATION = API_BASE_URL.replace(/\/$/, "") + "/route-elevation";
   var ELEVATION_MAX_SAMPLES = 96; // one Open-Meteo request (limit is 100)
@@ -1138,8 +1151,8 @@
   }
 
   // ---------------------------------------------------------------------------
-  // Elevation — fetched after the route is shown, browser → Open-Meteo first,
-  // backend /route-elevation as the fallback (see OPEN_METEO_ELEVATION_URL)
+  // Elevation — fetched after the route is shown: terrain tiles first, then
+  // Open-Meteo, then the backend (see TERRAIN_TILE_URL for why)
   // ---------------------------------------------------------------------------
 
   /** @type {AbortController|null} In-flight elevation lookup, cancelled by a new route. */
@@ -1161,22 +1174,313 @@
     return out;
   }
 
-  /**
-   * Total gain (sum of every uphill step) and the biggest single climb
-   * (largest low-to-high rise, via a running minimum). Same maths as the
-   * backend's elevation_stats().
-   */
-  function elevationStats(profile) {
-    var gain = 0;
-    var maxClimb = 0;
-    var minSoFar = profile[0];
-    for (var i = 1; i < profile.length; i++) {
-      var curr = profile[i];
-      if (curr > profile[i - 1]) { gain += curr - profile[i - 1]; }
-      if (curr < minSoFar) { minSoFar = curr; }
-      else if (curr - minSoFar > maxClimb) { maxClimb = curr - minSoFar; }
+  /** Great-circle distance in metres between two [lng, lat] points. */
+  function haversineM(a, b) {
+    var toRad = Math.PI / 180;
+    var dLat = (b[1] - a[1]) * toRad;
+    var dLng = (b[0] - a[0]) * toRad;
+    var h = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+      Math.cos(a[1] * toRad) * Math.cos(b[1] * toRad) *
+      Math.sin(dLng / 2) * Math.sin(dLng / 2);
+    return 2 * 6371000 * Math.asin(Math.sqrt(h));
+  }
+
+  /** Points every `stepM` metres along the line (first and last kept). */
+  function resampleLine(coords, stepM) {
+    var out = [coords[0]];
+    var carry = 0;
+    for (var i = 1; i < coords.length; i++) {
+      var a = coords[i - 1], b = coords[i];
+      var d = haversineM(a, b);
+      if (d === 0) { continue; }
+      var pos = stepM - carry;
+      while (pos <= d) {
+        var t = pos / d;
+        out.push([a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]);
+        pos += stepM;
+      }
+      carry = d - (pos - stepM);
     }
-    return { gain: gain, maxClimb: maxClimb };
+    out.push(coords[coords.length - 1]);
+    return out;
+  }
+
+  // --- Profile maths ---------------------------------------------------------
+
+  /** Running median over a k-wide window — knocks out single-sample spikes. */
+  function medianFilter(p, k) {
+    var h = Math.floor(k / 2);
+    return p.map(function (_, i) {
+      var w = p.slice(Math.max(0, i - h), i + h + 1).sort(function (x, y) { return x - y; });
+      var m = Math.floor(w.length / 2);
+      return w.length % 2 ? w[m] : (w[m - 1] + w[m]) / 2;
+    });
+  }
+
+  /**
+   * Elevation gain with a dead band, the way GPS watches count it: a climb
+   * only counts once it rises `t` metres above the last turning point, so
+   * terrain-model noise doesn't add up into fake metres of climbing.
+   */
+  function gainWithThreshold(p, t) {
+    var gain = 0;
+    var anchor = p[0];
+    for (var i = 1; i < p.length; i++) {
+      if (p[i] - anchor >= t) { gain += p[i] - anchor; anchor = p[i]; }
+      else if (anchor - p[i] >= t) { anchor = p[i]; }
+    }
+    return gain;
+  }
+
+  /** Largest single low-to-high rise anywhere on the route (running minimum). */
+  function biggestClimb(p) {
+    var best = 0;
+    var lo = p[0];
+    for (var i = 1; i < p.length; i++) {
+      if (p[i] < lo) { lo = p[i]; }
+      else if (p[i] - lo > best) { best = p[i] - lo; }
+    }
+    return best;
+  }
+
+  /** Running mean over a k-wide window. */
+  function meanFilter(p, k) {
+    var h = Math.floor(k / 2);
+    return p.map(function (_, i) {
+      var w = p.slice(Math.max(0, i - h), i + h + 1);
+      return w.reduce(function (s, v) { return s + v; }, 0) / w.length;
+    });
+  }
+
+  /**
+   * Smoothing per data source, each tuned against USGS 1 m lidar on 8 US test
+   * routes (gain error: worst / average):
+   *
+   * - tiles: bare-earth tiles (USGS NED, UK lidar). Light median + 1 m band.
+   *   Worst 7 m / avg 4 m.
+   * - tilesCoarse: tiles built from SRTM satellite data (most countries
+   *   outside the US/UK). SRTM catches some buildings, so average over ~425 m
+   *   (17 samples x 25 m). Worst 57 m (skyscraper cores) / avg 23 m; raw it
+   *   was off by up to 420 m.
+   * - openMeteo: 90 m model with buildings; 5-point median + 3 m band.
+   *   Worst 165 m / avg 39 m — the last resort.
+   */
+  var ELEVATION_SMOOTHING = {
+    tiles:       { median: 3, mean: 1,  threshold: 1 },
+    tilesCoarse: { median: 1, mean: 17, threshold: 1 },
+    openMeteo:   { median: 5, mean: 1,  threshold: 3 },
+  };
+
+  function elevationStats(profile, source) {
+    var cfg = ELEVATION_SMOOTHING[source];
+    var smooth = profile;
+    if (cfg.median > 1) { smooth = medianFilter(smooth, cfg.median); }
+    if (cfg.mean > 1) { smooth = meanFilter(smooth, cfg.mean); }
+    return {
+      profile: smooth,
+      gain: gainWithThreshold(smooth, cfg.threshold),
+      maxClimb: biggestClimb(smooth),
+    };
+  }
+
+  // --- Terrain tiles (terrarium PNG) ----------------------------------------
+
+  /**
+   * Minimal PNG decoder for terrain tiles (8-bit RGB/RGBA, non-interlaced).
+   *
+   * Pixels are NOT read back through <canvas>: privacy browsers (Brave,
+   * Firefox resistFingerprinting) add noise to canvas reads, and in this
+   * encoding one unit of red is 256 m of height. Decoding the bytes directly
+   * sidesteps that entirely.
+   */
+  function decodePng(buf) {
+    var bytes = new Uint8Array(buf);
+    var sig = [137, 80, 78, 71, 13, 10, 26, 10];
+    for (var s = 0; s < 8; s++) {
+      if (bytes[s] !== sig[s]) { return Promise.reject(new Error("Tile is not a PNG")); }
+    }
+    var view = new DataView(buf);
+    var width = 0, height = 0, channels = 0, idat = [];
+    var off = 8;
+    while (off + 8 <= bytes.length) {
+      var len = view.getUint32(off);
+      var type = String.fromCharCode(bytes[off + 4], bytes[off + 5], bytes[off + 6], bytes[off + 7]);
+      var body = bytes.subarray(off + 8, off + 8 + len);
+      if (type === "IHDR") {
+        width = view.getUint32(off + 8);
+        height = view.getUint32(off + 12);
+        var bitDepth = body[8], colorType = body[9], interlace = body[12];
+        channels = colorType === 2 ? 3 : colorType === 6 ? 4 : 0;
+        if (bitDepth !== 8 || !channels || interlace !== 0) {
+          return Promise.reject(new Error("Unsupported tile PNG format"));
+        }
+      } else if (type === "IDAT") {
+        idat.push(body);
+      } else if (type === "IEND") {
+        break;
+      }
+      off += 12 + len;
+    }
+    if (!width || !idat.length) { return Promise.reject(new Error("Corrupt tile PNG")); }
+
+    var stream = new Blob(idat).stream().pipeThrough(new DecompressionStream("deflate"));
+    return new Response(stream).arrayBuffer().then(function (raw) {
+      var src = new Uint8Array(raw);
+      var stride = width * channels;
+      if (src.length < height * (stride + 1)) { throw new Error("Truncated tile PNG"); }
+      var out = new Uint8Array(height * stride);
+      for (var y = 0; y < height; y++) {
+        var filter = src[y * (stride + 1)];
+        var inRow = y * (stride + 1) + 1;
+        var row = y * stride;
+        var prev = row - stride;
+        for (var x = 0; x < stride; x++) {
+          var a = x >= channels ? out[row + x - channels] : 0;
+          var b = y > 0 ? out[prev + x] : 0;
+          var c = y > 0 && x >= channels ? out[prev + x - channels] : 0;
+          var v = src[inRow + x];
+          if (filter === 1) { v += a; }
+          else if (filter === 2) { v += b; }
+          else if (filter === 3) { v += (a + b) >> 1; }
+          else if (filter === 4) {
+            var pa = Math.abs(b - c), pb = Math.abs(a - c), pc = Math.abs(a + b - 2 * c);
+            v += pa <= pb && pa <= pc ? a : pb <= pc ? b : c;
+          }
+          out[row + x] = v & 255;
+        }
+      }
+      return { width: width, height: height, channels: channels, data: out };
+    });
+  }
+
+  /**
+   * True if a tile is built from bare-earth survey data (USGS NED in the
+   * US/Canada, UK Environment Agency lidar). Elsewhere tiles come from SRTM
+   * and friends, which partly include buildings and need heavier smoothing.
+   * Unknown sources are treated as coarse — the safer choice.
+   */
+  function isBareEarthSource(sources) {
+    return sources.split(",").some(function (s) {
+      return /^\s*(ned|uk_lidar)/.test(s);
+    });
+  }
+
+  /** Decoded tiles kept between routes ("z/x/y" → Promise<tile>). */
+  var terrainTileCache = new Map();
+
+  function getTerrainTile(z, x, y) {
+    var key = z + "/" + x + "/" + y;
+    if (terrainTileCache.has(key)) { return terrainTileCache.get(key); }
+    if (terrainTileCache.size > 200) { terrainTileCache.clear(); }
+    var url = TERRAIN_TILE_URL.replace("{z}", z).replace("{x}", x).replace("{y}", y);
+    // No abort signal: a tile is shared via the cache, so one cancelled route
+    // mustn't fail it for the next. Stale results are ignored by the caller.
+    var p = fetch(url)
+      .then(function (res) {
+        if (!res.ok) { throw new Error("Terrain tile HTTP " + res.status); }
+        // Which datasets this tile was built from (CORS-exposed header).
+        var sources = res.headers.get("x-amz-meta-x-imagery-sources") || "";
+        return res.arrayBuffer().then(decodePng).then(function (tile) {
+          tile.bareEarth = isBareEarthSource(sources);
+          return tile;
+        });
+      });
+    // Never cache a failure (or an abort) — the next route should retry.
+    p.catch(function () { terrainTileCache.delete(key); });
+    terrainTileCache.set(key, p);
+    return p;
+  }
+
+  /** Web-Mercator global pixel coordinates of [lng, lat] at zoom z. */
+  function toWorldPixel(c, z) {
+    var size = 256 * Math.pow(2, z);
+    var latRad = c[1] * Math.PI / 180;
+    return {
+      x: (c[0] + 180) / 360 * size,
+      y: (1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2 * size,
+    };
+  }
+
+  /** The 4 pixel centres around a point, for bilinear interpolation. */
+  function pixelNeighbourhood(c, z) {
+    var p = toWorldPixel(c, z);
+    var fx = p.x - 0.5, fy = p.y - 0.5;
+    var x0 = Math.floor(fx), y0 = Math.floor(fy);
+    return { x0: x0, y0: y0, dx: fx - x0, dy: fy - y0 };
+  }
+
+  function tileKeyForPixel(z, gx, gy) {
+    var n = Math.pow(2, z);
+    var tx = ((Math.floor(gx / 256) % n) + n) % n; // wrap across the antimeridian
+    var ty = Math.min(n - 1, Math.max(0, Math.floor(gy / 256)));
+    return { tx: tx, ty: ty, key: z + "/" + tx + "/" + ty };
+  }
+
+  /** Highest zoom whose tile count for these points stays within budget. */
+  function pickTerrainZoom(points) {
+    for (var z = TERRAIN_MAX_ZOOM; z > TERRAIN_MIN_ZOOM; z--) {
+      if (tilesForPoints(points, z).length <= TERRAIN_MAX_TILES) { return z; }
+    }
+    return TERRAIN_MIN_ZOOM;
+  }
+
+  function tilesForPoints(points, z) {
+    var seen = {};
+    var list = [];
+    points.forEach(function (c) {
+      var nb = pixelNeighbourhood(c, z);
+      [[0, 0], [1, 0], [0, 1], [1, 1]].forEach(function (o) {
+        var t = tileKeyForPixel(z, nb.x0 + o[0], nb.y0 + o[1]);
+        if (!seen[t.key]) { seen[t.key] = true; list.push(t); }
+      });
+    });
+    return list;
+  }
+
+  /** Browser → AWS terrain tiles. Resolves to the profile every 25 m (metres). */
+  function fetchElevationTiles(coords, signal) {
+    if (typeof DecompressionStream === "undefined") {
+      return Promise.reject(new Error("Browser lacks DecompressionStream"));
+    }
+    var points = resampleLine(coords, TERRAIN_SPACING_M);
+    var z = pickTerrainZoom(points);
+    var needed = tilesForPoints(points, z);
+
+    var aborted = new Promise(function (_, reject) {
+      signal.addEventListener("abort", function () { reject(new Error("Terrain tiles timed out")); });
+    });
+    return Promise.race([aborted, Promise.all(needed.map(function (t) {
+      return getTerrainTile(z, t.tx, t.ty).then(function (tile) {
+        return [t.key, tile];
+      });
+    })).then(function (pairs) {
+      var tiles = {};
+      pairs.forEach(function (p) { tiles[p[0]] = p[1]; });
+
+      function heightAt(gx, gy) {
+        var t = tiles[tileKeyForPixel(z, gx, gy).key];
+        var px = ((gx % 256) + 256) % 256, py = ((gy % 256) + 256) % 256;
+        var i = (py * t.width + px) * t.channels;
+        // Terrarium encoding: height = R*256 + G + B/256 - 32768 metres.
+        return t.data[i] * 256 + t.data[i + 1] + t.data[i + 2] / 256 - 32768;
+      }
+
+      var profile = points.map(function (c) {
+        var nb = pixelNeighbourhood(c, z);
+        var e00 = heightAt(nb.x0, nb.y0), e10 = heightAt(nb.x0 + 1, nb.y0);
+        var e01 = heightAt(nb.x0, nb.y0 + 1), e11 = heightAt(nb.x0 + 1, nb.y0 + 1);
+        return (e00 * (1 - nb.dx) + e10 * nb.dx) * (1 - nb.dy) +
+               (e01 * (1 - nb.dx) + e11 * nb.dx) * nb.dy;
+      });
+      // Sanity check: anything outside Earth's range means a bad decode.
+      var ok = profile.length >= 2 && profile.every(function (v) {
+        return isFinite(v) && v > -500 && v < 9000;
+      });
+      if (!ok) { throw new Error("Terrain tiles returned implausible heights"); }
+      // One coarse tile anywhere on the loop → smooth the whole loop for it.
+      var allBareEarth = pairs.every(function (p) { return p[1].bareEarth; });
+      return { profile: profile, source: allBareEarth ? "tiles" : "tilesCoarse" };
+    })]);
   }
 
   /** Abort `controller` after ms, unless it settles first. Returns a cancel fn. */
@@ -1219,11 +1523,11 @@
     }).then(function (data) { return data.elevation_profile; });
   }
 
-  function showElevation(profile) {
-    var s = elevationStats(profile);
+  function showElevation(profile, source) {
+    var s = elevationStats(profile, source);
     statMaxClimb.textContent = String(Math.round(s.maxClimb));
     elevGain.textContent     = "+" + formatElevationM(s.gain);
-    renderElevationChart(profile, s.gain);
+    renderElevationChart(s.profile, s.gain);
   }
 
   function loadElevation(route) {
@@ -1235,10 +1539,11 @@
     elevGain.textContent     = "...";
     renderElevationChart([], 0, "loading");
 
+    var coords = route.coordinates || [];
     var samples = (route.elevation_samples && route.elevation_samples.length >= 2)
       ? route.elevation_samples
-      : sampleCoords(route.coordinates || [], ELEVATION_MAX_SAMPLES);
-    if (samples.length < 2) {
+      : sampleCoords(coords, ELEVATION_MAX_SAMPLES);
+    if (coords.length < 2 || samples.length < 2) {
       elevationAbort = null;
       statMaxClimb.textContent = "--";
       elevGain.textContent     = "Unavailable";
@@ -1248,26 +1553,36 @@
 
     // Each attempt gets its own timeout; aborting `controller` (a new route)
     // cancels whichever attempt is running.
-    function attempt(fn) {
+    function attempt(fn, input, source) {
       var inner = new AbortController();
       var onOuterAbort = function () { inner.abort(); };
       controller.signal.addEventListener("abort", onOuterAbort);
       var clear = abortAfter(inner, ELEVATION_TIMEOUT_MS);
-      return fn(samples, inner.signal).finally(function () {
-        clear();
-        controller.signal.removeEventListener("abort", onOuterAbort);
-      });
+      return fn(input, inner.signal)
+        .then(function (r) {
+          // Tiles report their own quality; the others return a bare profile.
+          return Array.isArray(r) ? { profile: r, source: source } : r;
+        })
+        .finally(function () {
+          clear();
+          controller.signal.removeEventListener("abort", onOuterAbort);
+        });
     }
 
-    attempt(fetchElevationDirect)
-      .catch(function (err) {
+    function orFallBackTo(fn, input, source) {
+      return function (err) {
         if (controller.signal.aborted) { throw err; }
-        console.warn("Direct elevation lookup failed, trying backend:", err);
-        return attempt(fetchElevationViaBackend);
-      })
-      .then(function (profile) {
+        console.warn("Elevation source failed, trying next:", err);
+        return attempt(fn, input, source);
+      };
+    }
+
+    attempt(fetchElevationTiles, coords, "tiles")
+      .catch(orFallBackTo(fetchElevationDirect, samples, "openMeteo"))
+      .catch(orFallBackTo(fetchElevationViaBackend, samples, "openMeteo"))
+      .then(function (result) {
         if (elevationAbort !== controller) { return; }
-        showElevation(profile);
+        showElevation(result.profile, result.source);
       })
       .catch(function (err) {
         if (elevationAbort !== controller) { return; }

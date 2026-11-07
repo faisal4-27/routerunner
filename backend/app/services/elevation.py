@@ -26,27 +26,51 @@ MAX_POINTS_PER_REQUEST = 100
 ELEVATION_MAX_SAMPLES = 96
 
 
+# Smoothing for Open-Meteo profiles, tuned against USGS lidar ground truth.
+# Summing every raw uphill step over-counted badly (e.g. 344 m vs a real
+# 24 m in Midtown Manhattan); a 5-point median plus a 3 m dead band was the
+# best fit. Must match ELEVATION_SMOOTHING.openMeteo in app.js.
+SMOOTH_MEDIAN_WINDOW = 5
+GAIN_THRESHOLD_M = 3.0
+
+
+def _median_filter(values: Sequence[float], k: int) -> List[float]:
+    half = k // 2
+    out: List[float] = []
+    for i in range(len(values)):
+        window = sorted(values[max(0, i - half) : i + half + 1])
+        mid = len(window) // 2
+        out.append(window[mid] if len(window) % 2 else (window[mid - 1] + window[mid]) / 2)
+    return out
+
+
 def elevation_stats(elevations: Sequence[float]) -> Tuple[float, float]:
     """
     Return (total_gain_m, max_climb_m) for a series of elevation samples.
 
-    `total_gain_m` is the sum of every uphill step — exactly the figure a
-    runner sees on a GPS watch as "elevation gain".
+    The profile is median-smoothed first, then gain is counted with a dead
+    band, like a GPS watch: a climb only counts once it rises
+    GAIN_THRESHOLD_M above the last turning point, so terrain-model noise
+    doesn't add up into fake climbing.
 
     `max_climb_m` is the largest sustained low-to-high difference anywhere
-    on the route, found with Kadane's running-minimum trick. It tells you
-    how big the worst single climb on the loop is — a more useful stat than
-    elevation loss, which for a closed loop is just gain repeated.
+    on the (smoothed) route, found with a running minimum — a more useful
+    stat than elevation loss, which for a closed loop is just gain repeated.
     """
-    gain = 0.0
-    max_climb = 0.0
-    min_so_far = elevations[0] if elevations else 0.0
+    if not elevations:
+        return 0.0, 0.0
+    smooth = _median_filter(elevations, SMOOTH_MEDIAN_WINDOW)
 
-    for i in range(1, len(elevations)):
-        prev = elevations[i - 1]
-        curr = elevations[i]
-        if curr > prev:
-            gain += curr - prev
+    gain = 0.0
+    anchor = smooth[0]
+    max_climb = 0.0
+    min_so_far = smooth[0]
+    for curr in smooth[1:]:
+        if curr - anchor >= GAIN_THRESHOLD_M:
+            gain += curr - anchor
+            anchor = curr
+        elif anchor - curr >= GAIN_THRESHOLD_M:
+            anchor = curr
         if curr < min_so_far:
             min_so_far = curr
         elif curr - min_so_far > max_climb:
